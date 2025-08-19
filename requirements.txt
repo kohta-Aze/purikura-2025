@@ -1,0 +1,52 @@
+customtkinter>=5.2
+opencv-python>=4.8
+Pillow>=10.0
+qrcode>=7.4
+requests>=2.31
+numpy>=1.26
+
+---
+
+## セットアップ
+
+1. **仮想環境を作成**
+   ```powershell
+   py -3.11 -m venv venv
+   .\venv\Scripts\activate
+
+2.依存をインストール
+pip install -r requirements.txt
+
+3.素材の配置
+backgrounds/ にフレーム画像（透過PNG推奨）
+stamps/ にスタンプ画像（透過PNG推奨）
+
+.\venv\Scripts\activate
+python .\main_app.py
+
+
+AWS連携の前提
+
+main_app.py の API_GATEWAY_URL に API Gateway のベースURL を設定しています。
+例: https://xxxx.execute-api.ap-northeast-1.amazonaws.com
+
+POST {BASE}/upload に {"photo_count": n} を送信 → レスポンスで
+
+uploadUrls: [presigned_url1, ...]
+
+viewerUrl: "https://..."
+を受け取り、各URLに PUT (Content-Type: image/png) でアップロードします（既存仕様を変更しません）。
+
+使い方
+
+起動すると「撮影をはじめる」ボタンが表示されます。
+
+撮影画面でライブビューが出たら 「3秒カウントで撮影」。
+
+「選択へ」 で一覧から編集する写真を選び、編集画面へ。
+
+フレーム/スタンプ/お絵描きで編集 → 「これで決定！」。
+
+「最終選択」 でアップロード対象をチェック → 「アップロード」。
+
+表示された QRコード をスマホなどで読み取り、写真を閲覧/保存できます。
