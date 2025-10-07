@@ -4,6 +4,7 @@ Pillow>=10.0
 qrcode>=7.4
 requests>=2.31
 numpy>=1.26
+mediapipe>=0.10
 
 ---
 

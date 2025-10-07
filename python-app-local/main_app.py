@@ -10,10 +10,13 @@ UIは customtkinter ベースのモダンデザイン。
 """
 
 import io
+import json
 import queue
 import threading
 import time
-import json
+from datetime import datetime
+from pathlib import Path
+
 import cv2
 import numpy as np
 import requests
@@ -26,6 +29,7 @@ from editor_app import (
     EditingFrame, FinalSelectionFrame, PhotoSelectionFrame, PostEditChoiceFrame,
     ShootingFrame, StartFrame, ThankYouFrame
 )
+from ui.consent import request_share_consent
 
 
 class ImageUploader:
@@ -234,6 +238,21 @@ class MainApplication(ctk.CTk):
         # API Gateway ベースURL（仕様固定）
         API_GATEWAY_URL = "https://ezbu8f0gai.execute-api.ap-northeast-1.amazonaws.com"
 
+        self.samples_dir = Path('samples')
+        self.samples_dir.mkdir(exist_ok=True)
+        self.sample_index_path = self.samples_dir / "index.json"
+        self._ensure_sample_index()
+        self.ar_settings: dict[str, object] = {
+            'enable_crown': True,
+            'enable_aura': True,
+            'ema_alpha': 0.2,
+            'aura_color': (255, 120, 220),
+            'aura_intensity': 0.6,
+            'aura_frequency': 1.5,
+            'aura_spread': 2.0,
+            'aura_mix_mode': 'rgb_add',
+        }
+
         # 専門家インスタンス
         self.camera = None
         self.asset_manager = AssetManager()
@@ -278,7 +297,75 @@ class MainApplication(ctk.CTk):
 
         param frame_class: 表示したいFrameクラス（StartFrame等）
         """
-        self.frames[frame_class].tkraise()
+        frame = self.frames[frame_class]
+        frame.tkraise()
+        if hasattr(frame, 'on_show'):
+            frame.on_show()
+
+    def update_ar_settings(self, settings: dict[str, object]):
+        """AR設定を更新し、カメラへ反映する。"""
+
+        self.ar_settings.update(settings)
+        if self.camera:
+            self.camera.configure_ar(self.ar_settings)
+
+    def _ensure_sample_index(self):
+        """samples/index.json が存在しなければ初期化する。"""
+
+        if not self.sample_index_path.exists():
+            with self.sample_index_path.open('w', encoding='utf-8') as fp:
+                json.dump([], fp, ensure_ascii=False, indent=2)
+
+    def _sanitize_metadata(self, metadata: list[dict[str, object]] | None) -> list[dict[str, object]]:
+        """JSONシリアライズ可能な形に変換する。"""
+
+        sanitized: list[dict[str, object]] = []
+        if not metadata:
+            return sanitized
+        for action in metadata:
+            safe_action: dict[str, object] = {}
+            for key, value in action.items():
+                if isinstance(value, tuple):
+                    safe_action[key] = list(value)
+                else:
+                    safe_action[key] = value
+            sanitized.append(safe_action)
+        return sanitized
+
+    def register_sample(self, image: Image.Image, metadata: list[dict[str, object]] | None):
+        """共有許諾済み画像を samples/ に保存しインデックスを更新する。"""
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        filename = f"sample_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        image_copy = image.copy()
+        image_copy.thumbnail((640, 480))
+        image_path = self.samples_dir / filename
+        image_copy.save(image_path, "PNG")
+
+        with self.sample_index_path.open('r', encoding='utf-8') as fp:
+            try:
+                index_data = json.load(fp)
+            except json.JSONDecodeError:
+                index_data = []
+        entry = {
+            'image': filename,
+            'meta': self._sanitize_metadata(metadata),
+            'savedAt': timestamp,
+        }
+        index_data.insert(0, entry)
+        with self.sample_index_path.open('w', encoding='utf-8') as fp:
+            json.dump(index_data, fp, ensure_ascii=False, indent=2)
+        start_frame = self.frames[StartFrame]
+        start_frame.add_sample_entry(entry)
+
+    def _prompt_share_consent(self, image: Image.Image, metadata: list[dict[str, object]] | None):
+        """共有許諾モーダルを開き、結果に応じて保存する。"""
+
+        def _callback(allow: bool):
+            if allow:
+                self.register_sample(image, metadata)
+
+        request_share_consent(self, _callback, preview_image=image)
 
     # ---------- 撮影 ----------
     def start_camera(self):
@@ -300,6 +387,7 @@ class MainApplication(ctk.CTk):
 
         # 2) カメラ起動
         self.camera = CameraCapture(CameraThread())
+        self.camera.configure_ar(self.ar_settings)
         self.camera.start()
 
         # 3) 画面遷移（少し待ってから）
@@ -387,6 +475,8 @@ class MainApplication(ctk.CTk):
         """
         edited_image = self.compositor.get_final_image()
         if edited_image:
+            metadata = self.editor.get_edit_history()
+            self._prompt_share_consent(edited_image.copy(), metadata)
             cv_image = cv2.cvtColor(np.array(edited_image), cv2.COLOR_RGBA2BGRA)
             self.edited_photos.append(cv_image)
         self.show_frame(PostEditChoiceFrame)
