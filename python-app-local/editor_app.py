@@ -8,12 +8,24 @@ customtkinter を用いたモダンUI実装。
 HiDPI対応のため、画像表示には CTkImage を使用します。
 """
 
+import json
 import os
+import time
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
 import cv2
 from PIL import Image, ImageDraw
 import qrcode
 import customtkinter as ctk
+from tkinter import colorchooser
+
+from ar.crown_tracker import CrownTracker
+from ar.aura import AuraRenderer
+from draw import coords as coord_utils
+from draw.smoothing import StrokeSmoother
+from ui.consent import request_share_consent
 
 
 # =========================================================
@@ -41,6 +53,19 @@ class CameraCapture:
         param camera_thread: 起動済み/未起動の CameraThread インスタンス
         """
         self.thread = camera_thread
+        self.crown_tracker = CrownTracker()
+        self.aura_renderer = AuraRenderer()
+        self._last_raw_frame: cv2.typing.MatLike | None = None
+        self.ar_settings: dict[str, Any] = {
+            'enable_crown': True,
+            'enable_aura': True,
+            'ema_alpha': 0.2,
+            'aura_color': (255, 120, 220),
+            'aura_intensity': 0.6,
+            'aura_frequency': 1.5,
+            'aura_spread': 2.0,
+            'aura_mix_mode': 'rgb_add',
+        }
 
     def start(self):
         """
@@ -68,7 +93,13 @@ class CameraCapture:
 
         output: 画像配列 or None（取得できない場合）
         """
-        return self.thread.get_latest_frame()
+        frame = self.thread.get_latest_frame()
+        if frame is not None:
+            self._last_raw_frame = frame.copy()
+            return frame
+        if self._last_raw_frame is not None:
+            return self._last_raw_frame.copy()
+        return None
 
     def get_display_frame(self) -> ctk.CTkImage | None:
         """
@@ -83,11 +114,21 @@ class CameraCapture:
         """
         frame = self.thread.get_latest_frame()
         if frame is not None:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self._last_raw_frame = frame.copy()
+            processed, faces = self.crown_tracker.apply(frame, self.ar_settings)
+            processed = self.aura_renderer.apply(processed, faces, self.ar_settings)
+            frame_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
             img.thumbnail((960, 540))
             return ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
         return None
+
+    def configure_ar(self, settings: dict[str, Any]):
+        """AR関連の設定を更新する。"""
+
+        self.ar_settings.update(settings)
+        if not self.ar_settings.get('enable_crown', True):
+            self.crown_tracker.reset()
 
 
 class AssetManager:
@@ -155,6 +196,7 @@ class ImageEditor:
         self.photo_layer: Image.Image | None = None
         self.frame_layer: Image.Image | None = None
         self.drawing_layer: Image.Image | None = None
+        self.edit_history: list[dict[str, Any]] = []
 
     def set_photo(self, cv2_image: cv2.typing.MatLike):
         """
@@ -170,6 +212,7 @@ class ImageEditor:
         original_image = cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB)
         self.photo_layer = Image.fromarray(original_image).convert("RGBA")
         self.drawing_layer = Image.new("RGBA", self.photo_layer.size, (0, 0, 0, 0))
+        self.edit_history = []
 
     def set_frame(self, frame_image: Image.Image):
         """
@@ -179,6 +222,7 @@ class ImageEditor:
         """
         if self.photo_layer:
             self.frame_layer = frame_image.resize(self.photo_layer.size)
+            self.add_history_action({'type': 'frame', 'size': self.frame_layer.size})
 
     def get_drawing_canvas(self) -> Image.Image | None:
         """
@@ -187,6 +231,16 @@ class ImageEditor:
         output: PIL.Image or None
         """
         return self.drawing_layer
+
+    def add_history_action(self, action: dict[str, Any]):
+        """編集操作を履歴に追加する。"""
+
+        self.edit_history.append(action)
+
+    def get_edit_history(self) -> list[dict[str, Any]]:
+        """編集履歴を取得する。"""
+
+        return list(self.edit_history)
 
 
 class ImageCompositor:
@@ -323,7 +377,7 @@ class BackgroundSelector(ctk.CTkToplevel):
         """
         param parent: 親ウィンドウ
         param assets: [{'name': str, 'image': PIL.Image}, ...]
-        param callback: 選択完了時に呼ぶ関数（引数 image: PIL.Image）
+        param callback: 選択完了時に呼ぶ関数（引数 asset: dict）
         """
         super().__init__(parent)
         self.title("フレーム選択")
@@ -342,7 +396,7 @@ class BackgroundSelector(ctk.CTkToplevel):
 
         param asset: {'name': str, 'image': PIL.Image}
         """
-        self.callback(asset['image'])
+        self.callback(asset)
         self.destroy()
 
 
@@ -355,7 +409,7 @@ class StampSelector(ctk.CTkToplevel):
         """
         param parent: 親ウィンドウ
         param assets: [{'name': str, 'image': PIL.Image}, ...]
-        param callback: 選択完了時に呼ぶ関数（引数 image: PIL.Image）
+        param callback: 選択完了時に呼ぶ関数（引数 asset: dict）
         """
         super().__init__(parent)
         self.title("スタンプ選択")
@@ -374,7 +428,7 @@ class StampSelector(ctk.CTkToplevel):
 
         param asset: {'name': str, 'image': PIL.Image}
         """
-        self.callback(asset['image'])
+        self.callback(asset)
         self.destroy()
 
 
@@ -392,6 +446,9 @@ class StartFrame(ctk.CTkFrame):
         """
         super().__init__(parent)
         self.controller = controller
+        self.samples_dir = Path('samples')
+        self.samples: list[dict[str, Any]] = []
+        self.current_sample_index = 0
 
         header = ctk.CTkLabel(self, text="Purikura Booth", font=ctk.CTkFont(size=36, weight="bold"))
         header.pack(pady=(24, 6))
@@ -409,6 +466,119 @@ class StartFrame(ctk.CTkFrame):
         hint = ctk.CTkLabel(self, text="※カメラと素材の読み込みには数秒かかることがあります")
         hint.pack(pady=(6, 0))
 
+        self.gallery_frame = ctk.CTkFrame(self, corner_radius=16)
+        self.gallery_frame.pack(fill="x", padx=40, pady=(24, 16))
+        ctk.CTkLabel(
+            self.gallery_frame,
+            text="作例ギャラリー",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(pady=(12, 4))
+
+        gallery_inner = ctk.CTkFrame(self.gallery_frame)
+        gallery_inner.pack(fill="x", padx=16, pady=(4, 12))
+
+        ctk.CTkButton(gallery_inner, text="◀", width=40, command=lambda: self.shift_sample(-1)).pack(side="left", padx=6)
+        center = ctk.CTkFrame(gallery_inner)
+        center.pack(side="left", expand=True, fill="both")
+        ctk.CTkButton(gallery_inner, text="▶", width=40, command=lambda: self.shift_sample(1)).pack(side="left", padx=6)
+
+        self.sample_image_label = ctk.CTkLabel(center, text="まだ作例がありません", anchor="center")
+        self.sample_image_label.pack(pady=(6, 4))
+        self.sample_meta_label = ctk.CTkLabel(center, text="", wraplength=360, justify="center")
+        self.sample_meta_label.pack(pady=(0, 8))
+        self.sample_image_label.image = None
+
+    def on_show(self):
+        """画面表示時に作例一覧をリロードする。"""
+
+        self.load_samples()
+        self.display_sample(self.current_sample_index)
+
+    def load_samples(self):
+        """samples/index.json を読み込んで一覧を更新する。"""
+
+        index_path = self.samples_dir / "index.json"
+        if index_path.exists():
+            try:
+                with index_path.open('r', encoding='utf-8') as fp:
+                    self.samples = json.load(fp)
+            except json.JSONDecodeError:
+                self.samples = []
+        else:
+            self.samples = []
+        if self.samples:
+            self.current_sample_index %= len(self.samples)
+        else:
+            self.current_sample_index = 0
+
+    def display_sample(self, index: int = 0):
+        """指定インデックスの作例を画面に表示する。"""
+
+        if not self.samples:
+            self.sample_image_label.configure(image=None, text="まだ作例がありません")
+            self.sample_image_label.image = None
+            self.sample_meta_label.configure(text="")
+            return
+        self.current_sample_index = index % len(self.samples)
+        entry = self.samples[self.current_sample_index]
+        image_path = self.samples_dir / entry.get('image', '')
+        if image_path.exists():
+            preview = Image.open(image_path).convert("RGBA")
+            preview.thumbnail((360, 240))
+            ctk_img = ctk.CTkImage(light_image=preview, dark_image=preview, size=preview.size)
+            self.sample_image_label.configure(image=ctk_img, text="")
+            self.sample_image_label.image = ctk_img
+        else:
+            self.sample_image_label.configure(image=None, text="画像が見つかりません")
+            self.sample_image_label.image = None
+        meta_text = self._format_meta(entry.get('meta'))
+        timestamp = entry.get('savedAt')
+        if timestamp:
+            meta_text = f"保存: {timestamp}\n" + meta_text
+        self.sample_meta_label.configure(text=meta_text)
+
+    def shift_sample(self, delta: int):
+        """カルーセルを左右に移動する。"""
+
+        if not self.samples:
+            return
+        new_index = (self.current_sample_index + delta) % len(self.samples)
+        self.display_sample(new_index)
+
+    def add_sample_entry(self, entry: dict[str, Any]):
+        """新しい作例を内部リストに追加し表示を更新する。"""
+
+        self.samples.insert(0, entry)
+        self.current_sample_index = 0
+        self.display_sample(0)
+
+    def _format_meta(self, meta: Any) -> str:
+        """編集メタ情報を人が読みやすい文章に整形する。"""
+
+        if not meta:
+            return "編集メタ情報なし"
+        lines: list[str] = []
+        if isinstance(meta, list):
+            for action in meta:
+                action_type = action.get('type')
+                if action_type == 'frame_select':
+                    lines.append(f"フレーム: {action.get('name', '不明')}")
+                elif action_type == 'stamp_select':
+                    lines.append(f"スタンプ選択: {action.get('name', '不明')}")
+                elif action_type == 'stamp':
+                    lines.append(f"スタンプ配置: {action.get('name', '不明')}")
+                elif action_type == 'stroke':
+                    lines.append(
+                        f"ストローク: 色={action.get('color')}, 点数={action.get('points')}"
+                    )
+                elif action_type == 'clear_drawing':
+                    lines.append("描画レイヤをクリア")
+                elif action_type == 'frame':
+                    lines.append("フレーム適用")
+        if not lines:
+            return "編集メタ情報なし"
+        return "\n".join(lines)
+
 
 class ShootingFrame(ctk.CTkFrame):
     """
@@ -423,6 +593,27 @@ class ShootingFrame(ctk.CTkFrame):
         """
         super().__init__(parent)
         self.controller = controller
+        settings = getattr(controller, 'ar_settings', {
+            'enable_crown': True,
+            'enable_aura': True,
+            'ema_alpha': 0.2,
+            'aura_color': (255, 120, 220),
+            'aura_intensity': 0.6,
+            'aura_frequency': 1.5,
+            'aura_spread': 2.0,
+            'aura_mix_mode': 'rgb_add',
+        })
+        self.ar_vars = {
+            'enable_crown': ctk.BooleanVar(value=settings.get('enable_crown', True)),
+            'enable_aura': ctk.BooleanVar(value=settings.get('enable_aura', True)),
+            'ema_alpha': ctk.DoubleVar(value=settings.get('ema_alpha', 0.2)),
+            'aura_intensity': ctk.DoubleVar(value=settings.get('aura_intensity', 0.6)),
+            'aura_frequency': ctk.DoubleVar(value=settings.get('aura_frequency', 1.5)),
+            'aura_spread': ctk.DoubleVar(value=settings.get('aura_spread', 2.0)),
+            'aura_mix_mode': ctk.StringVar(value=settings.get('aura_mix_mode', 'rgb_add')),
+        }
+        self.ar_color_var = ctk.StringVar(value=self._rgb_to_hex(settings.get('aura_color', (255, 120, 220))))
+        self.ar_window: ctk.CTkToplevel | None = None
 
         # ライブビュー
         self.preview_label = ctk.CTkLabel(self, text="カメラ接続中…", width=800, height=450, corner_radius=12)
@@ -442,6 +633,7 @@ class ShootingFrame(ctk.CTkFrame):
                       command=controller.go_to_photo_selection).grid(row=0, column=1, padx=6)
         ctk.CTkButton(btn_row, text="やりなおす", width=140,
                       command=controller.retake_photos).grid(row=0, column=2, padx=6)
+        ctk.CTkButton(btn_row, text="AR設定", width=140, command=self.open_ar_settings).grid(row=0, column=3, padx=6)
 
         # 撮影枚数
         self.count_taken_var = ctk.StringVar(value="0 枚")
@@ -449,6 +641,104 @@ class ShootingFrame(ctk.CTkFrame):
         ctk.CTkLabel(self, textvariable=self.count_taken_var).pack()
 
         self._after_id = None
+
+    def _rgb_to_hex(self, color: tuple[int, int, int]) -> str:
+        """RGBタプルを#RRGGBB形式に変換する。"""
+
+        return "#" + "".join(f"{max(0, min(255, c)):02x}" for c in color)
+
+    def _hex_to_rgb(self, hex_color: str) -> tuple[int, int, int]:
+        """#RRGGBB文字列をRGBタプルへ変換する。"""
+
+        hex_color = hex_color.lstrip('#')
+        if len(hex_color) != 6:
+            return (255, 120, 220)
+        return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+    def open_ar_settings(self):
+        """AR設定モーダルを開く。"""
+
+        if self.ar_window and self.ar_window.winfo_exists():
+            self.ar_window.focus()
+            return
+        current = getattr(self.controller, 'ar_settings', {})
+        for key, var in self.ar_vars.items():
+            if key in current:
+                value = current[key]
+                if isinstance(var, ctk.BooleanVar):
+                    var.set(bool(value))
+                elif isinstance(var, ctk.DoubleVar):
+                    var.set(float(value))
+                else:
+                    var.set(str(value))
+        if 'aura_color' in current:
+            self.ar_color_var.set(self._rgb_to_hex(tuple(current['aura_color'])))
+        self.ar_window = ctk.CTkToplevel(self)
+        self.ar_window.title("ARエフェクト設定")
+        self.ar_window.geometry("360x460")
+        self.ar_window.resizable(False, False)
+
+        ctk.CTkLabel(self.ar_window, text="王冠", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(16, 4))
+        ctk.CTkSwitch(self.ar_window, text="王冠を表示", variable=self.ar_vars['enable_crown'],
+                      command=self.apply_ar_settings).pack(pady=4)
+        ctk.CTkLabel(self.ar_window, text="王冠EMA α").pack(pady=(8, 2))
+        ema_slider = ctk.CTkSlider(self.ar_window, from_=0.05, to=0.8, number_of_steps=75,
+                                   variable=self.ar_vars['ema_alpha'], command=lambda _: self.apply_ar_settings())
+        ema_slider.pack(padx=18, fill="x")
+
+        ctk.CTkLabel(self.ar_window, text="波動", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(18, 4))
+        ctk.CTkSwitch(self.ar_window, text="波動を表示", variable=self.ar_vars['enable_aura'],
+                      command=self.apply_ar_settings).pack(pady=4)
+        color_row = ctk.CTkFrame(self.ar_window)
+        color_row.pack(pady=(8, 2), fill="x", padx=18)
+        ctk.CTkLabel(color_row, text="色").pack(side="left")
+        ctk.CTkButton(color_row, textvariable=self.ar_color_var, command=self._choose_color).pack(side="left", padx=12)
+
+        ctk.CTkLabel(self.ar_window, text="強度").pack(pady=(8, 2))
+        intensity_slider = ctk.CTkSlider(self.ar_window, from_=0.1, to=1.5, number_of_steps=28,
+                                         variable=self.ar_vars['aura_intensity'], command=lambda _: self.apply_ar_settings())
+        intensity_slider.pack(padx=18, fill="x")
+
+        ctk.CTkLabel(self.ar_window, text="周波数").pack(pady=(8, 2))
+        freq_slider = ctk.CTkSlider(self.ar_window, from_=0.5, to=3.0, number_of_steps=25,
+                                    variable=self.ar_vars['aura_frequency'], command=lambda _: self.apply_ar_settings())
+        freq_slider.pack(padx=18, fill="x")
+
+        ctk.CTkLabel(self.ar_window, text="拡散速度").pack(pady=(8, 2))
+        spread_slider = ctk.CTkSlider(self.ar_window, from_=0.5, to=4.0, number_of_steps=35,
+                                      variable=self.ar_vars['aura_spread'], command=lambda _: self.apply_ar_settings())
+        spread_slider.pack(padx=18, fill="x")
+
+        ctk.CTkLabel(self.ar_window, text="混色モード").pack(pady=(10, 4))
+        mix_menu = ctk.CTkOptionMenu(self.ar_window, values=["rgb_add", "hsv"],
+                                     variable=self.ar_vars['aura_mix_mode'], command=lambda _: self.apply_ar_settings())
+        mix_menu.pack(pady=(0, 16))
+
+        ctk.CTkButton(self.ar_window, text="閉じる", command=self.ar_window.destroy).pack(pady=(0, 18))
+
+    def _choose_color(self):
+        """色選択ダイアログを開いて更新する。"""
+
+        rgb_tuple, hex_color = colorchooser.askcolor(color=self.ar_color_var.get(), title="波動カラー")
+        if hex_color:
+            self.ar_color_var.set(hex_color)
+            self.apply_ar_settings()
+
+    def apply_ar_settings(self):
+        """UIの値を収集してコントローラへ通知する。"""
+
+        updated = {
+            'enable_crown': self.ar_vars['enable_crown'].get(),
+            'enable_aura': self.ar_vars['enable_aura'].get(),
+            'ema_alpha': float(self.ar_vars['ema_alpha'].get()),
+            'aura_intensity': float(self.ar_vars['aura_intensity'].get()),
+            'aura_frequency': float(self.ar_vars['aura_frequency'].get()),
+            'aura_spread': float(self.ar_vars['aura_spread'].get()),
+            'aura_mix_mode': self.ar_vars['aura_mix_mode'].get(),
+            'aura_color': self._hex_to_rgb(self.ar_color_var.get()),
+        }
+        if hasattr(self.controller, 'update_ar_settings'):
+            self.controller.update_ar_settings(updated)
 
     def reset(self):
         """
@@ -577,6 +867,26 @@ class EditingFrame(ctk.CTkFrame):
 
         ctk.CTkButton(tool_panel, text="ぜんぶ消す", command=self.clear_all_drawings).pack(pady=(6, 2))
 
+        ctk.CTkLabel(tool_panel, text="補間モード").pack(pady=(12, 4))
+        self.smoothing_var = ctk.StringVar(value="catmull")
+        smoothing_menu = ctk.CTkOptionMenu(
+            tool_panel,
+            values=["catmull", "linear"],
+            variable=self.smoothing_var,
+            command=lambda _: self._update_smoother()
+        )
+        smoothing_menu.pack(pady=(0, 6), fill="x", padx=12)
+
+        ctk.CTkLabel(tool_panel, text="予測フィルタ").pack(pady=(4, 4))
+        self.prediction_var = ctk.StringVar(value="off")
+        prediction_menu = ctk.CTkOptionMenu(
+            tool_panel,
+            values=["off", "ewma", "kalman"],
+            variable=self.prediction_var,
+            command=lambda _: self._update_smoother()
+        )
+        prediction_menu.pack(pady=(0, 8), fill="x", padx=12)
+
         # アセット
         asset_row = ctk.CTkFrame(tool_panel)
         asset_row.pack(pady=(12, 8))
@@ -596,14 +906,19 @@ class EditingFrame(ctk.CTkFrame):
 
         # 編集状態
         self.is_drawing = False
-        self.last_x, self.last_y = None, None
+        self.stroke_smoother = StrokeSmoother()
+        self.device_pixel_ratio = 1.0
+        self.coord_context: coord_utils.CoordinateContext | None = None
+        self.stroke_points: list[tuple[float, float]] = []
+        self.last_drawn_point: tuple[float, float] | None = None
+        self.current_stamp_name = ""
         self.display_image: ctk.CTkImage | None = None
         self.display_size: tuple[int, int] | None = None  # CTkImage表示サイズを保持
 
         # イベント
-        self.preview_label.bind("<B1-Motion>", self.draw_on_canvas)
-        self.preview_label.bind("<ButtonRelease-1>", self.stop_drawing)
-        self.preview_label.bind("<Button-1>", self.place_stamp_at_click)
+        self.preview_label.bind("<ButtonPress-1>", self.on_pointer_down)
+        self.preview_label.bind("<B1-Motion>", self.on_pointer_move)
+        self.preview_label.bind("<ButtonRelease-1>", self.on_pointer_up)
 
     # --- 既存ロジック互換（プロパティ） ---
     @property
@@ -617,6 +932,7 @@ class EditingFrame(ctk.CTkFrame):
         """
         編集開始時にプレビューを初期表示する。
         """
+        self.device_pixel_ratio = coord_utils.get_device_pixel_ratio(self)
         self.update_display_image()
 
     def change_pen_color(self, new_color: str):
@@ -634,53 +950,131 @@ class EditingFrame(ctk.CTkFrame):
         """
         if self.editor.photo_layer:
             self.editor.drawing_layer = Image.new("RGBA", self.editor.photo_layer.size, (0, 0, 0, 0))
+            self.editor.add_history_action({'type': 'clear_drawing'})
             self.update_display_image()
 
-    def set_frame(self, frame_image: Image.Image):
+    def set_frame(self, asset: dict):
         """
         フレームを適用してプレビュー更新。
 
-        param frame_image: フレームPIL画像
+        param asset: フレーム情報（name, image）
         """
+        frame_image = asset['image'] if isinstance(asset, dict) else asset
         self.editor.set_frame(frame_image)
+        if isinstance(asset, dict):
+            self.editor.add_history_action({'type': 'frame_select', 'name': asset.get('name', 'unknown')})
         self.update_display_image()
 
-    def draw_on_canvas(self, event):
-        """
-        プレビュー上でドラッグした軌跡を描画レイヤへ反映する。
+    def _update_smoother(self):
+        """補間・予測モードをStrokeSmootherに反映する。"""
 
-        関数の処理
-        ----------
-        - 表示画像サイズから元画像サイズへのスケール変換
-        - ペン/消しゴム/キラキラ（擬似ブラシ）を描画
+        self.stroke_smoother.configure(
+            method=self.smoothing_var.get(),
+            prediction_mode=self.prediction_var.get(),
+        )
 
-        param event: Tkのマウスイベント（event.x, event.y を使用）
-        """
-        if not self.is_drawing:
-            self.is_drawing = True
-            self.last_x, self.last_y = event.x, event.y
+    def on_pointer_down(self, event):
+        """プレビュー上でマウスが押されたときの処理。"""
+
+        if self.pen_color == "stamp_mode":
+            self._handle_stamp(event)
             return
         if not self.editor.drawing_layer or not self.editor.photo_layer:
             return
+        self.is_drawing = True
+        self._update_smoother()
+        self.stroke_smoother.reset()
+        self.device_pixel_ratio = coord_utils.get_device_pixel_ratio(self)
+        if self.display_size is None:
+            self.update_display_image()
+        if self.display_size is None:
+            return
+        self.coord_context = coord_utils.CoordinateContext(
+            image_size=self.editor.photo_layer.size,
+            display_size=self.display_size,
+            dpr=self.device_pixel_ratio,
+        )
+        x_img, y_img = coord_utils.display_to_image_coords(event.x, event.y, self.coord_context)
+        timestamp = time.perf_counter()
+        self.stroke_smoother.add_sample((x_img, y_img, timestamp))
+        self.last_drawn_point = (x_img, y_img)
+        self.stroke_points = [coord_utils.normalize_coords(x_img, y_img, self.coord_context)]
 
+    def on_pointer_move(self, event):
+        """ドラッグ中の座標を補間しながら描画する。"""
+
+        if not self.is_drawing or not self.editor.drawing_layer or not self.coord_context:
+            return
+        x_img, y_img = coord_utils.display_to_image_coords(event.x, event.y, self.coord_context)
+        timestamp = time.perf_counter()
+        segments = self.stroke_smoother.add_sample((x_img, y_img, timestamp))
+        if not segments:
+            segments = [(x_img, y_img)]
+        for pt in segments:
+            if self.last_drawn_point is not None:
+                self._apply_segment(self.last_drawn_point, pt)
+            self.last_drawn_point = pt
+        self.stroke_points.append(coord_utils.normalize_coords(x_img, y_img, self.coord_context))
+        self.update_display_image()
+
+    def on_pointer_up(self, event):
+        """マウスボタンが離れたらストロークを確定する。"""
+
+        if self.pen_color == "stamp_mode":
+            self._handle_stamp(event)
+            return
+        if not self.is_drawing:
+            return
+        if self.stroke_points:
+            self.editor.add_history_action({
+                'type': 'stroke',
+                'color': self.pen_color,
+                'points': len(self.stroke_points),
+                'prediction': self.prediction_var.get(),
+                'method': self.smoothing_var.get(),
+            })
+        self.is_drawing = False
+        self.stroke_points = []
+        self.last_drawn_point = None
+        self.stroke_smoother.reset()
+
+    def _apply_segment(self, start: tuple[float, float], end: tuple[float, float]):
+        """現在のブラシ設定で1セグメントを描く。"""
+
+        if not self.editor.drawing_layer:
+            return
         draw = ImageDraw.Draw(self.editor.drawing_layer)
-        w, h = self.editor.photo_layer.size
-        # CTkImageにはwidth()/height()が無いので、保存したサイズを利用
-        disp_w, disp_h = (self.display_size if self.display_size else self.editor.photo_layer.size)
-
-        def scale(x, y): return (x * w / disp_w, y * h / disp_h)
-
-        scaled_last = scale(self.last_x, self.last_y)
-        scaled_current = scale(event.x, event.y)
-
         if self.pen_color == "eraser":
-            draw.line([scaled_last, scaled_current], fill=(0, 0, 0, 0), width=self.pen_width, joint="round")
+            draw.line([start, end], fill=(0, 0, 0, 0), width=self.pen_width, joint="round")
         elif self.pen_color == "black":
-            draw.line([scaled_last, scaled_current], fill=self.pen_color, width=self.pen_width, joint="round")
+            draw.line([start, end], fill=self.pen_color, width=self.pen_width, joint="round")
         else:
-            self.draw_sparkly_line(draw, scaled_last, scaled_current)
+            self.draw_sparkly_line(draw, start, end)
 
-        self.last_x, self.last_y = event.x, event.y
+    def _handle_stamp(self, event):
+        """スタンプ配置を行い、履歴を記録する。"""
+
+        if self.pen_color != "stamp_mode":
+            return
+        if not hasattr(self, 'current_stamp') or not self.editor.photo_layer or not self.editor.drawing_layer:
+            return
+        if self.display_size is None:
+            self.update_display_image()
+        context = coord_utils.CoordinateContext(
+            image_size=self.editor.photo_layer.size,
+            display_size=self.display_size if self.display_size else self.editor.photo_layer.size,
+            dpr=self.device_pixel_ratio,
+        )
+        x_img, y_img = coord_utils.display_to_image_coords(event.x, event.y, context)
+        stamp_w, stamp_h = self.current_stamp.size
+        top_left_x = int(x_img - stamp_w / 2)
+        top_left_y = int(y_img - stamp_h / 2)
+        self.editor.drawing_layer.paste(self.current_stamp, (top_left_x, top_left_y), mask=self.current_stamp)
+        self.editor.add_history_action({
+            'type': 'stamp',
+            'name': getattr(self, 'current_stamp_name', 'unknown'),
+            'position': coord_utils.normalize_coords(x_img, y_img, context),
+        })
         self.update_display_image()
 
     def draw_sparkly_line(self, draw: ImageDraw.ImageDraw, start: tuple, end: tuple):
@@ -702,35 +1096,6 @@ class EditingFrame(ctk.CTkFrame):
             dy = _r.uniform(-self.pen_width * 2, self.pen_width * 2)
             draw.point((x + dx, y + dy), fill=_r.choice([self.pen_color, "white"]))
 
-    def stop_drawing(self, event):
-        """
-        マウスボタンを離したら描画状態を終了する。
-        """
-        self.is_drawing = False
-        self.last_x, self.last_y = None, None
-
-    def place_stamp_at_click(self, event):
-        """
-        スタンプモード時、クリック位置にスタンプを貼る。
-
-        関数の処理
-        ----------
-        - 表示 → 元画像座標へスケール変換
-        - スタンプ中心がクリック位置に来るように貼付
-
-        param event: Tkのマウスイベント
-        """
-        if self.pen_color != "stamp_mode":
-            return
-        if hasattr(self, 'current_stamp') and self.editor.photo_layer and self.editor.drawing_layer:
-            w, h = self.editor.photo_layer.size
-            disp_w, disp_h = (self.display_size if self.display_size else self.editor.photo_layer.size)
-            stamp_w, stamp_h = self.current_stamp.size
-            top_left_x = int(event.x * w / disp_w) - stamp_w // 2
-            top_left_y = int(event.y * h / disp_h) - stamp_h // 2
-            self.editor.drawing_layer.paste(self.current_stamp, (top_left_x, top_left_y), mask=self.current_stamp)
-            self.update_display_image()
-
     def open_stamp_selector(self):
         """
         スタンプ選択ポップアップを開く。
@@ -740,15 +1105,21 @@ class EditingFrame(ctk.CTkFrame):
             return
         StampSelector(self, self.asset_manager.stamps, self.activate_stamp_mode)
 
-    def activate_stamp_mode(self, stamp_image: Image.Image):
+    def activate_stamp_mode(self, asset: dict):
         """
         選んだスタンプを現在のスタンプとして登録し、モードを有効化。
 
-        param stamp_image: スタンプ画像（PIL）
+        param asset: スタンプ情報（name, image）
         """
         self.pen_color = "stamp_mode"
+        stamp_image = asset['image'] if isinstance(asset, dict) else asset
         self.current_stamp = stamp_image.copy()
         self.current_stamp.thumbnail((150, 150))
+        if isinstance(asset, dict):
+            self.current_stamp_name = asset.get('name', 'stamp')
+            self.editor.add_history_action({'type': 'stamp_select', 'name': self.current_stamp_name})
+        else:
+            self.current_stamp_name = 'stamp'
 
     def update_display_image(self):
         """
@@ -762,6 +1133,12 @@ class EditingFrame(ctk.CTkFrame):
             resized.thumbnail((960, 540))
             self.display_image = ctk.CTkImage(light_image=resized, dark_image=resized, size=resized.size)
             self.display_size = resized.size  # (w, h)
+            if self.editor.photo_layer:
+                self.coord_context = coord_utils.CoordinateContext(
+                    image_size=self.editor.photo_layer.size,
+                    display_size=self.display_size,
+                    dpr=self.device_pixel_ratio,
+                )
             self.preview_label.configure(image=self.display_image, text="")
             self.preview_label.image = self.display_image  # 参照保持
 
