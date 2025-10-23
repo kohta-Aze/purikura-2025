@@ -30,6 +30,7 @@ from editor_app import (
     ShootingFrame, StartFrame, ThankYouFrame
 )
 from ui.consent import request_share_consent
+from ui.privacy_consent import PrivacyConsentManager
 
 
 class ImageUploader:
@@ -280,12 +281,16 @@ class MainApplication(ctk.CTk):
             self.frames[F] = frame
             frame.grid(row=0, column=0, sticky="nsew")
 
+        self.consent_manager = PrivacyConsentManager(self)
+
         self.show_frame(StartFrame)
 
         # ステータスバー
         self.status_var = ctk.StringVar(value="準備完了")
         self.status_bar = ctk.CTkLabel(self, textvariable=self.status_var, anchor="w")
         self.status_bar.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
+
+        self.after(100, self.consent_manager.ensure_consent)
 
         # 終了処理
         self.protocol("WM_DELETE_WINDOW", self.shutdown)
@@ -372,12 +377,20 @@ class MainApplication(ctk.CTk):
         """
         撮影を開始する（スタート画面のボタンから呼ばれる）。
 
-        処理概要
-        ----------
-        - 撮影/編集済みの写真をクリア
-        - CameraThread を起動してライブビュー準備
-        - 撮影画面へ遷移してプレビュー更新開始
+        利用同意が得られていなければダイアログを表示して処理を保留し、
+        同意後に撮影準備へ進む。
         """
+        manager = getattr(self, "consent_manager", None)
+        if manager:
+            if manager.is_declined:
+                return
+            if not manager.ensure_consent(self._start_camera_after_consent):
+                return
+
+        self._start_camera_after_consent()
+
+    def _start_camera_after_consent(self):
+        """同意取得後に実行する撮影準備処理。"""
         print("遷移: スタート -> 撮影画面")
         self.status_var.set("カメラ準備中…")
 
