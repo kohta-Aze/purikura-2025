@@ -78,7 +78,7 @@ class CrownTracker:
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
-        print("[DEBUG] face landmarks found:", 0 if not results.multi_face_landmarks else len(results.multi_face_landmarks))
+        print("[DEBUG] CrownTracker landmarks:", 0 if not results.multi_face_landmarks else len(results.multi_face_landmarks))
         if not results.multi_face_landmarks:
             self.reset()
             return frame_bgr.copy(), []

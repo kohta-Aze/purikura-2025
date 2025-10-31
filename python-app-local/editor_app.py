@@ -133,6 +133,7 @@ class CameraCapture:
         try:
             print("[DEBUG] _apply_effects called with effects:", [e.name for e in self.active_effects])
             out = apply_ar_effects(frame, self.active_effects, time.time())
+            print("[DEBUG] apply_ar_effects final effects:", [e.name for e in self.active_effects])
             print("[DEBUG] apply_ar_effects returned frame shape:", getattr(out, "shape", None))
             return out
         except Exception as exc:  # pragma: no cover - runtime diagnostic

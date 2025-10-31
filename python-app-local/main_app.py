@@ -589,6 +589,7 @@ class MainApplication(ctk.CTk):
                     final_image = rendered[0]
                 else:
                     final_image = rendered
+            print("[DEBUG] export path uses AR output")
             final_image_rgba = final_image.convert("RGBA")
             metadata = self.editor.get_edit_history()
             self._prompt_share_consent(final_image_rgba.copy(), metadata)

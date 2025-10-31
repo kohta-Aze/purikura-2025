@@ -1213,7 +1213,9 @@ def _compose_with_state(
 
 def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float) -> np.ndarray:
     if not active_effects:
-        # no AR overlays requested; don't touch Mediapipe at all
+        print("[DEBUG] effect_names in apply_ar_effects:", [])
+        print("[DEBUG] apply_ar_effects mode:", "none")
+        print("[DEBUG] apply_ar_effects returning composited frame shape:", getattr(frame, "shape", None))
         print("[DEBUG] apply_ar_effects final effects:", [])
         return frame
 
@@ -1221,7 +1223,8 @@ def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float)
     print("[DEBUG] effect_names in apply_ar_effects:", effect_names)
     residual_effects = [effect for effect in active_effects if effect.name not in _SPECIAL_EFFECTS]
 
-    composed = frame.copy()
+    output = frame.copy()
+    faces: list[dict[str, float]] | None = None
     engine: AREngine | None = None
     state: dict[str, Any] | None = None
 
@@ -1229,26 +1232,31 @@ def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float)
         engine = get_engine()
         engine.update_frame(frame, timestamp)
         state = engine.get_state()
-        composed = _compose_with_state(composed, residual_effects, state, timestamp, engine)
+        output = _compose_with_state(output, residual_effects, state, timestamp, engine)
 
     if "crown_basic" in effect_names:
         crown_effect = next((effect for effect in active_effects if effect.name == "crown_basic"), None)
         tracker = _get_crown_tracker(crown_effect)
-        faces: list[dict[str, float]] | None = None
-        if tracker is not None:
-            composed_candidate, faces = tracker.apply(composed, {"enable_crown": True, "ema_alpha": 0.2})
-            print("[DEBUG] crown_tracker faces:", len(faces) if faces is not None else "None")
-            if faces:
-                composed = composed_candidate
+        tracker_ready = bool(tracker and getattr(tracker, "face_mesh", None) is not None)
+        if tracker_ready and tracker is not None:
+            output_candidate, faces = tracker.apply(output, {"enable_crown": True, "ema_alpha": 0.2})
+            print("[DEBUG] CrownTracker faces:", 0 if not faces else len(faces))
+            if faces and len(faces) > 0:
+                output = output_candidate
             else:
-                composed = draw_fallback_crown(composed, crown_effect)
+                print("[DEBUG] tracker had 0 faces -> fallback crown")
+                faces = faces or []
+                output = draw_fallback_crown(output, crown_effect)
         else:
-            print("[DEBUG] crown_tracker unavailable; using fallback crown")
-            composed = draw_fallback_crown(composed, crown_effect)
-        print("[DEBUG] apply_ar_effects returning composited frame with crown")
+            print("[DEBUG] tracker not ready -> fallback crown")
+            output = draw_fallback_crown(output, crown_effect)
+            faces = []
 
+    mode = "tracked" if (faces and len(faces) > 0) else ("fallback" if "crown_basic" in effect_names else "standard")
+    print("[DEBUG] apply_ar_effects mode:", mode)
+    print("[DEBUG] apply_ar_effects returning composited frame shape:", getattr(output, "shape", None))
     print("[DEBUG] apply_ar_effects final effects:", effect_names)
-    return composed
+    return output
 
 
 def apply_to_still(
@@ -1262,32 +1270,41 @@ def apply_to_still(
         timestamp = time.time()
 
     effect_names = [effect.name for effect in active_effects]
+    print("[DEBUG] effect_names in apply_ar_effects (still):", effect_names)
     residual_effects = [effect for effect in active_effects if effect.name not in _SPECIAL_EFFECTS]
 
     state: dict[str, Any] | None = None
-    composed = frame.copy()
+    output = frame.copy()
+    faces: list[dict[str, float]] | None = None
 
     if residual_effects:
         engine = get_engine()
         state = engine.process_static_frame(frame, timestamp)
-        composed = _compose_with_state(composed, residual_effects, state, timestamp, engine)
+        output = _compose_with_state(output, residual_effects, state, timestamp, engine)
 
     if "crown_basic" in effect_names:
         crown_effect = next((effect for effect in active_effects if effect.name == "crown_basic"), None)
         tracker = _get_crown_tracker(crown_effect)
-        faces: list[dict[str, float]] | None = None
-        if tracker is not None:
-            composed_candidate, faces = tracker.apply(composed, {"enable_crown": True, "ema_alpha": 0.2})
-            print("[DEBUG] crown_tracker faces (still):", len(faces) if faces is not None else "None")
-            if faces:
-                composed = composed_candidate
+        tracker_ready = bool(tracker and getattr(tracker, "face_mesh", None) is not None)
+        if tracker_ready and tracker is not None:
+            output_candidate, faces = tracker.apply(output, {"enable_crown": True, "ema_alpha": 0.2})
+            print("[DEBUG] CrownTracker faces (still):", 0 if not faces else len(faces))
+            if faces and len(faces) > 0:
+                output = output_candidate
             else:
-                composed = draw_fallback_crown(composed, crown_effect)
+                print("[DEBUG] tracker had 0 faces (still) -> fallback crown")
+                faces = faces or []
+                output = draw_fallback_crown(output, crown_effect)
         else:
-            print("[DEBUG] crown_tracker unavailable for still; using fallback crown")
-            composed = draw_fallback_crown(composed, crown_effect)
+            print("[DEBUG] tracker not ready (still) -> fallback crown")
+            output = draw_fallback_crown(output, crown_effect)
+            faces = []
 
-    return composed, state
+    mode = "tracked" if (faces and len(faces) > 0) else ("fallback" if "crown_basic" in effect_names else "standard")
+    print("[DEBUG] apply_to_still mode:", mode)
+    print("[DEBUG] apply_to_still returning composited frame shape:", getattr(output, "shape", None))
+
+    return output, state
 
 
 def extract_person_mask(
