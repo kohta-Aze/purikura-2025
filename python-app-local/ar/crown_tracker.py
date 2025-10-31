@@ -67,6 +67,7 @@ class CrownTracker:
         output: (合成済みフレーム, [{'center': (x,y), 'radius': r}...])
         """
 
+        print("[DEBUG] CrownTracker.apply called. has_face_mesh:", self.face_mesh is not None)
         if self.face_mesh is None:
             return frame_bgr.copy(), []
         enable = bool(settings.get('enable_crown', True))
@@ -77,6 +78,7 @@ class CrownTracker:
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
+        print("[DEBUG] face landmarks found:", 0 if not results.multi_face_landmarks else len(results.multi_face_landmarks))
         if not results.multi_face_landmarks:
             self.reset()
             return frame_bgr.copy(), []

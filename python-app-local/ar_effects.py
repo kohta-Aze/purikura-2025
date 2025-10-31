@@ -282,6 +282,7 @@ class AREngine:
         self.detection_size = detection_size
         self.ema_alpha = ema_alpha
         self._frame_lock = threading.Condition()
+        self._inference_lock = threading.Lock()
         self._latest_frame: tuple[np.ndarray, float] | None = None
         self._last_state: dict[str, Any] | None = None
         self._last_error: str | None = None
@@ -355,7 +356,8 @@ class AREngine:
                 frame, ts = self._latest_frame
                 self._latest_frame = None
             try:
-                state = self._process_frame(frame, ts)
+                with self._inference_lock:
+                    state = self._process_frame(frame, ts)
                 self._last_state = state
             except Exception as exc:  # pragma: no cover - runtime diagnostic
                 self._last_error = f"AR推論でエラーが発生しました: {exc}"
@@ -363,6 +365,22 @@ class AREngine:
     # ------------------------------------------------------------------
     # Processing helpers
     # ------------------------------------------------------------------
+
+    def process_static_frame(self, frame: np.ndarray, timestamp: float | None = None) -> dict[str, Any] | None:
+        """Process a single still frame synchronously and return the AR state."""
+
+        if frame is None:
+            return self._last_state
+        if timestamp is None:
+            timestamp = time.time()
+        try:
+            with self._inference_lock:
+                state = self._process_frame(frame, timestamp)
+        except Exception as exc:  # pragma: no cover - runtime diagnostic
+            self._last_error = f"AR推論でエラーが発生しました: {exc}"
+            return self._last_state
+        self._last_state = state
+        return state
 
     def _process_frame(self, frame: np.ndarray, timestamp: float) -> dict[str, Any]:
         height, width = frame.shape[:2]
@@ -1078,10 +1096,13 @@ def get_effect_packs() -> dict[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float) -> np.ndarray:
-    engine = get_engine()
-    engine.update_frame(frame, timestamp)
-    state = engine.get_state()
+def _compose_with_state(
+    frame: np.ndarray,
+    active_effects: Sequence[Effect],
+    state: dict[str, Any] | None,
+    timestamp: float,
+    engine: AREngine,
+) -> np.ndarray:
     if not active_effects or not state:
         return frame.copy()
     overlays: list[Overlay] = []
@@ -1098,6 +1119,51 @@ def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float)
     for overlay in overlays:
         composed = _blend_overlay(composed, overlay, segmentation)
     return composed
+
+
+def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float) -> np.ndarray:
+    if not active_effects:
+        # no AR overlays requested; don't touch Mediapipe at all
+        return frame
+    engine = get_engine()
+    engine.update_frame(frame, timestamp)
+    state = engine.get_state()
+    return _compose_with_state(frame, active_effects, state, timestamp, engine)
+
+
+def apply_to_still(
+    frame: np.ndarray,
+    active_effects: Sequence[Effect],
+    timestamp: float | None = None,
+) -> tuple[np.ndarray, dict[str, Any] | None]:
+    """Apply effects to a still image and return the composed frame and AR state."""
+
+    engine = get_engine()
+    if timestamp is None:
+        timestamp = time.time()
+    state = engine.process_static_frame(frame, timestamp)
+    composed = _compose_with_state(frame, active_effects, state, timestamp, engine)
+    return composed, state
+
+
+def extract_person_mask(
+    frame: np.ndarray, threshold: float = 0.6
+) -> tuple[np.ndarray | None, dict[str, Any] | None]:
+    """Return a foreground mask (0-1 float) for the primary person in the frame."""
+
+    engine = get_engine()
+    state = engine.process_static_frame(frame, time.time())
+    if not state:
+        return None, None
+    segmentation = state.get("segmentation")
+    if segmentation is None:
+        return None, state
+    mask = np.clip(segmentation, 0.0, 1.0)
+    if threshold is not None:
+        mask = (mask >= threshold).astype(np.float32)
+    else:
+        mask = mask.astype(np.float32)
+    return mask, state
 
 
 def _blend_overlay(base: np.ndarray, overlay: Overlay, segmentation: np.ndarray | None) -> np.ndarray:
@@ -1130,6 +1196,8 @@ __all__ = [
     "AREngine",
     "Effect",
     "apply",
+    "apply_to_still",
+    "extract_person_mask",
     "get_engine",
     "load_effects",
     "get_effect",

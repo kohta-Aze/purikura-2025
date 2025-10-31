@@ -19,14 +19,19 @@ if TYPE_CHECKING:
     from ar_effects import Effect
 
 import cv2
+import numpy as np
 from PIL import Image, ImageDraw
 import qrcode
 import customtkinter as ctk
+from tkinter import filedialog
 
 from ar_effects import apply as apply_ar_effects
 from draw import coords as coord_utils
 from draw.smoothing import StrokeSmoother
 from ui.consent import request_share_consent
+
+
+RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
 
 # =========================================================
@@ -116,6 +121,7 @@ class CameraCapture:
     def set_active_effects(self, effects: list['Effect']):
         """アクティブなARエフェクトを更新する。"""
 
+        print("[DEBUG] CameraCapture.set_active_effects got:", [e.name for e in effects])
         self.active_effects = effects
 
     def pop_last_error(self) -> str | None:
@@ -125,7 +131,10 @@ class CameraCapture:
 
     def _apply_effects(self, frame: cv2.typing.MatLike) -> cv2.typing.MatLike:
         try:
-            return apply_ar_effects(frame, self.active_effects, time.time())
+            print("[DEBUG] _apply_effects called with effects:", [e.name for e in self.active_effects])
+            out = apply_ar_effects(frame, self.active_effects, time.time())
+            print("[DEBUG] apply_ar_effects returned frame shape:", getattr(out, "shape", None))
+            return out
         except Exception as exc:  # pragma: no cover - runtime diagnostic
             self._last_error = f"ARエフェクト適用に失敗しました: {exc}"
             return frame.copy()
@@ -398,18 +407,27 @@ class KisekaePresetModal(ctk.CTkToplevel):
             for effect in effects:
                 var = ctk.BooleanVar(value=effect.name in self.active)
                 self.vars[effect.name] = var
-                preview_img = effect.get_preview_image().copy()
-                preview_img.thumbnail((96, 96))
-                ct_img = ctk.CTkImage(light_image=preview_img, dark_image=preview_img, size=preview_img.size)
-                self.previews[effect.name] = ct_img
+                ct_img: ctk.CTkImage | None = None
+                preview_img = None
+                try:
+                    preview_img = effect.get_preview_image().copy()
+                except Exception:
+                    preview_img = None
+                if preview_img:
+                    preview_img.thumbnail((96, 96))
+                    ct_img = ctk.CTkImage(light_image=preview_img, dark_image=preview_img, size=preview_img.size)
+                    self.previews[effect.name] = ct_img
                 row = ctk.CTkFrame(tab)
                 row.pack(fill="x", padx=8, pady=6)
 
                 content = ctk.CTkFrame(row)
                 content.pack(anchor="w", padx=6, pady=4, fill="x")
 
-                img_label = ctk.CTkLabel(content, image=ct_img, text="")
-                img_label.image = ct_img  # prevent GC
+                if ct_img is not None:
+                    img_label = ctk.CTkLabel(content, image=ct_img, text="")
+                    img_label.image = ct_img  # prevent GC
+                else:
+                    img_label = ctk.CTkLabel(content, text="プレビューなし", width=96)
                 img_label.pack(side="left", padx=(0, 8))
 
                 chk = ctk.CTkCheckBox(content, text=effect.display_name, variable=var, command=self._propagate)
@@ -888,8 +906,10 @@ class EditingFrame(ctk.CTkFrame):
         # アセット
         asset_row = ctk.CTkFrame(tool_panel)
         asset_row.pack(pady=(12, 8))
+        asset_row.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(asset_row, text="フレーム選択", width=120, command=self.open_frame_selector).grid(row=0, column=0, padx=4, pady=4)
         ctk.CTkButton(asset_row, text="スタンプ", width=120, command=self.open_stamp_selector).grid(row=0, column=1, padx=4, pady=4)
+        ctk.CTkButton(asset_row, text="背景変更", width=120, command=self.open_background_change_dialog).grid(row=1, column=0, columnspan=2, padx=4, pady=(4, 0))
 
         # 決定
         ctk.CTkButton(tool_panel, text="これで決定！", height=44, command=self.controller.finish_editing).pack(pady=(10, 12), fill="x", padx=8)
@@ -961,6 +981,71 @@ class EditingFrame(ctk.CTkFrame):
         self.editor.set_frame(frame_image)
         if isinstance(asset, dict):
             self.editor.add_history_action({'type': 'frame_select', 'name': asset.get('name', 'unknown')})
+        self.update_display_image()
+
+    def open_background_change_dialog(self):
+        """Open a file dialog and replace the photo background using segmentation."""
+
+        if not self.editor.photo_layer:
+            if hasattr(self.controller, 'status_var'):
+                self.controller.status_var.set("写真が読み込まれていません")
+            return
+        path = filedialog.askopenfilename(
+            title="背景画像を選択",
+            filetypes=[("画像ファイル", "*.png;*.jpg;*.jpeg;*.webp")],
+        )
+        if not path:
+            return
+        try:
+            background = Image.open(path).convert("RGBA")
+        except Exception as exc:
+            if hasattr(self.controller, 'status_var'):
+                self.controller.status_var.set(f"背景画像の読み込みに失敗: {exc}")
+            return
+        self.replace_background(background, source_path=path)
+
+    def replace_background(self, background: Image.Image, source_path: str | None = None):
+        """Replace the current photo layer's background with the given image."""
+
+        if not self.editor.photo_layer:
+            return
+        photo = self.editor.photo_layer.convert("RGBA")
+        mask = None
+        if hasattr(self.controller, 'compute_person_mask'):
+            mask = self.controller.compute_person_mask(photo)
+        if mask is None:
+            if hasattr(self.controller, 'status_var'):
+                self.controller.status_var.set("人物を検出できませんでした")
+            return
+        mask = np.clip(mask, 0.0, 1.0)
+        if not np.any(mask > 0.01):
+            if hasattr(self.controller, 'status_var'):
+                self.controller.status_var.set("人物領域が見つかりませんでした")
+            return
+        mask_alpha = (mask * 255).astype(np.uint8)
+        person_arr = np.array(photo)
+        if person_arr.shape[-1] == 3:
+            alpha_channel = np.full(person_arr.shape[:2], 255, dtype=np.uint8)
+            person_arr = np.dstack((person_arr, alpha_channel))
+        else:
+            alpha_channel = person_arr[..., 3]
+        combined_alpha = (alpha_channel.astype(np.float32) * (mask.astype(np.float32))).astype(np.uint8)
+        person_arr[..., 3] = combined_alpha
+        person = Image.fromarray(person_arr, mode="RGBA")
+
+        background_rgba = background.resize(photo.size, RESAMPLE_LANCZOS).convert("RGBA")
+        result = Image.alpha_composite(background_rgba, person)
+
+        self.editor.photo_layer = result
+        if self.editor.frame_layer and self.editor.frame_layer.size != result.size:
+            self.editor.frame_layer = self.editor.frame_layer.resize(result.size, RESAMPLE_LANCZOS)
+        if self.editor.drawing_layer and self.editor.drawing_layer.size != result.size:
+            self.editor.drawing_layer = self.editor.drawing_layer.resize(result.size, RESAMPLE_LANCZOS)
+
+        source_name = os.path.basename(source_path) if source_path else "custom"
+        self.editor.add_history_action({'type': 'background_replace', 'source': source_name})
+        if hasattr(self.controller, 'status_var'):
+            self.controller.status_var.set("背景を差し替えました")
         self.update_display_image()
 
     def _update_smoother(self):
@@ -1127,7 +1212,14 @@ class EditingFrame(ctk.CTkFrame):
             return
         preview_image = self.compositor.create_final_image()
         if preview_image:
-            resized = preview_image.copy()
+            rendered = preview_image
+            if hasattr(self.controller, 'render_effects_on_image'):
+                rendered_result = self.controller.render_effects_on_image(preview_image)
+                if isinstance(rendered_result, tuple):
+                    rendered = rendered_result[0]
+                else:
+                    rendered = rendered_result
+            resized = rendered.copy()
             resized.thumbnail((960, 540))
             self.display_image = ctk.CTkImage(light_image=resized, dark_image=resized, size=resized.size)
             self.display_size = resized.size  # (w, h)
