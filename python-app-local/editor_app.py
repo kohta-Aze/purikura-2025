@@ -121,6 +121,7 @@ class CameraCapture:
     def set_active_effects(self, effects: list['Effect']):
         """アクティブなARエフェクトを更新する。"""
 
+        print("[DEBUG] CameraCapture.set_active_effects got:", [e.name for e in effects])
         self.active_effects = effects
 
     def pop_last_error(self) -> str | None:
@@ -130,7 +131,10 @@ class CameraCapture:
 
     def _apply_effects(self, frame: cv2.typing.MatLike) -> cv2.typing.MatLike:
         try:
-            return apply_ar_effects(frame, self.active_effects, time.time())
+            print("[DEBUG] _apply_effects called with effects:", [e.name for e in self.active_effects])
+            out = apply_ar_effects(frame, self.active_effects, time.time())
+            print("[DEBUG] apply_ar_effects returned frame shape:", getattr(out, "shape", None))
+            return out
         except Exception as exc:  # pragma: no cover - runtime diagnostic
             self._last_error = f"ARエフェクト適用に失敗しました: {exc}"
             return frame.copy()

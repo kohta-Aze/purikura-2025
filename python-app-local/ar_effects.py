@@ -1122,6 +1122,9 @@ def _compose_with_state(
 
 
 def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float) -> np.ndarray:
+    if not active_effects:
+        # no AR overlays requested; don't touch Mediapipe at all
+        return frame
     engine = get_engine()
     engine.update_frame(frame, timestamp)
     state = engine.get_state()

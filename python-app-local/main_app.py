@@ -322,6 +322,10 @@ class MainApplication(ctk.CTk):
             if name in self.effect_registry and name not in unique:
                 unique.append(name)
         unique.sort(key=lambda n: self.effect_registry[n].priority)
+        print("[DEBUG] set_active_effects() got:", names)
+        print("[DEBUG] resolved unique:", unique)
+        if self.camera:
+            print("[DEBUG] sending to camera:", [e.name for e in self._resolve_active_effects()])
         self.active_effect_names = unique
         self.static_effect_state = None
         if self.camera:
