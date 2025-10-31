@@ -1,0 +1,22 @@
+{
+  "name": "uniform_top",
+  "display_name": "制服ジャケット",
+  "description": "肩幅に合わせて整う制服上着",
+  "category": "衣装",
+  "priority": 50,
+  "sprite": "uniform.png",
+  "anchors": [
+    {
+      "type": "pose",
+      "landmarks": ["LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"],
+      "transform": {
+        "scale_from": "distance('LEFT_SHOULDER','RIGHT_SHOULDER') * 2.1",
+        "rotation_from": "angle_deg('LEFT_SHOULDER','RIGHT_SHOULDER')",
+        "offset_px": ["0", "0.55 * distance('LEFT_SHOULDER','RIGHT_SHOULDER')"]
+      },
+      "z_index": 6,
+      "mask_with_segmentation": true,
+      "opacity": 1.0
+    }
+  ]
+}

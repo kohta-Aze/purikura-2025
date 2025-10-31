@@ -1,0 +1,22 @@
+{
+  "name": "crown_basic",
+  "display_name": "王冠",
+  "description": "頭の上で輝くベーシックな王冠",
+  "category": "頭",
+  "priority": 40,
+  "sprite": "crown.png",
+  "anchors": [
+    {
+      "type": "face",
+      "landmarks": ["FOREHEAD_CENTER", "LEFT_EAR", "RIGHT_EAR"],
+      "transform": {
+        "scale_from": "distance('LEFT_EAR','RIGHT_EAR') * 1.2",
+        "rotation_from": "angle_deg('LEFT_EAR','RIGHT_EAR')",
+        "offset_px": ["0", "-0.55 * distance('LEFT_EAR','RIGHT_EAR')"]
+      },
+      "z_index": 10,
+      "mask_with_segmentation": true,
+      "opacity": 1.0
+    }
+  ]
+}
