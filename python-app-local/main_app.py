@@ -16,7 +16,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 
 import cv2
 import numpy as np
@@ -24,7 +24,14 @@ import requests
 from PIL import Image
 import customtkinter as ctk
 
-from ar_effects import get_effect_packs as fetch_effect_packs, get_effects_by_category, load_effects, resolve_effects
+from ar_effects import (
+    apply_to_still,
+    extract_person_mask,
+    get_effect_packs as fetch_effect_packs,
+    get_effects_by_category,
+    load_effects,
+    resolve_effects,
+)
 
 # editor_app 側の画面/専門家
 from editor_app import (
@@ -288,6 +295,7 @@ class MainApplication(ctk.CTk):
         self.status_bar = ctk.CTkLabel(self, textvariable=self.status_var, anchor="w")
         self.status_bar.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
         self.set_active_effects([])
+        self.static_effect_state: dict[str, Any] | None = None
 
         self.after(100, self.consent_manager.ensure_consent)
 
@@ -314,13 +322,25 @@ class MainApplication(ctk.CTk):
             if name in self.effect_registry and name not in unique:
                 unique.append(name)
         unique.sort(key=lambda n: self.effect_registry[n].priority)
+        print("[DEBUG] set_active_effects() got:", names)
+        print("[DEBUG] resolved unique:", unique)
+        if self.camera:
+            print("[DEBUG] sending to camera:", [e.name for e in self._resolve_active_effects()])
         self.active_effect_names = unique
+        self.static_effect_state = None
         if self.camera:
             self.camera.set_active_effects(self._resolve_active_effects())
         summary = self.get_active_effect_summary()
         shooting_frame = self.frames.get(ShootingFrame)
         if shooting_frame:
             shooting_frame.update_active_effects_display(summary)
+        editing_frame = self.frames.get(EditingFrame)
+        if editing_frame and hasattr(editing_frame, "update_display_image"):
+            try:
+                editing_frame.update_display_image()
+            except Exception as exc:  # pragma: no cover - runtime diagnostic
+                if hasattr(self, "status_var"):
+                    self.status_var.set(f"きせかえ更新に失敗しました: {exc}")
         if hasattr(self, 'status_var'):
             self.status_var.set(f"きせかえ: {summary if summary else 'なし'}")
 
@@ -340,6 +360,53 @@ class MainApplication(ctk.CTk):
 
     def _resolve_active_effects(self) -> list['Effect']:
         return resolve_effects(self.active_effect_names)
+
+    def get_active_effects(self) -> list['Effect']:
+        """Return Effect objects for currently enabled presets."""
+
+        return self._resolve_active_effects()
+
+    def render_effects_on_image(
+        self, image: Image.Image
+    ) -> tuple[Image.Image, dict[str, Any] | None]:
+        """Overlay active AR effects on a still PIL image."""
+
+        self.static_effect_state = None
+        effects = self._resolve_active_effects()
+        if not effects or image is None:
+            return image, None
+        rgb = image.convert("RGB")
+        frame_bgr = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+        try:
+            composed_bgr, state = apply_to_still(frame_bgr, effects)
+        except RuntimeError as exc:
+            if hasattr(self, 'status_var'):
+                self.status_var.set(f"きせかえ適用に失敗しました: {exc}")
+            return image, None
+        result_rgb = cv2.cvtColor(composed_bgr, cv2.COLOR_BGR2RGB)
+        result = Image.fromarray(result_rgb)
+        if image.mode == "RGBA":
+            result = result.convert("RGBA")
+            result.putalpha(image.getchannel("A"))
+        self.static_effect_state = state
+        return result, state
+
+    def compute_person_mask(self, image: Image.Image) -> np.ndarray | None:
+        """Infer a person segmentation mask (float 0-1) from a PIL image."""
+
+        if image is None:
+            return None
+        rgb = image.convert("RGB")
+        frame_bgr = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+        try:
+            mask, state = extract_person_mask(frame_bgr)
+        except RuntimeError as exc:
+            if hasattr(self, 'status_var'):
+                self.status_var.set(f"人物セグメンテーションに失敗しました: {exc}")
+            return None
+        if state is not None:
+            self.static_effect_state = state
+        return mask
 
     def _ensure_sample_index(self):
         """samples/index.json が存在しなければ初期化する。"""
@@ -515,9 +582,17 @@ class MainApplication(ctk.CTk):
         """
         edited_image = self.compositor.get_final_image()
         if edited_image:
+            final_image = edited_image
+            if hasattr(self, 'render_effects_on_image'):
+                rendered = self.render_effects_on_image(edited_image)
+                if isinstance(rendered, tuple):
+                    final_image = rendered[0]
+                else:
+                    final_image = rendered
+            final_image_rgba = final_image.convert("RGBA")
             metadata = self.editor.get_edit_history()
-            self._prompt_share_consent(edited_image.copy(), metadata)
-            cv_image = cv2.cvtColor(np.array(edited_image), cv2.COLOR_RGBA2BGRA)
+            self._prompt_share_consent(final_image_rgba.copy(), metadata)
+            cv_image = cv2.cvtColor(np.array(final_image_rgba), cv2.COLOR_RGBA2BGRA)
             self.edited_photos.append(cv_image)
         self.show_frame(PostEditChoiceFrame)
 
