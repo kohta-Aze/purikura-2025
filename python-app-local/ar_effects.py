@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence
 
+from ar.crown_tracker import CrownTracker
+
 try:
     import mediapipe as mp  # type: ignore
 except ImportError as exc:  # pragma: no cover - handled at runtime
@@ -651,6 +653,8 @@ class AREngine:
 
 
 _ENGINE: AREngine | None = None
+_CROWN_TRACKER: CrownTracker | None = None
+_SPECIAL_EFFECTS = {"crown_basic"}
 
 
 def get_engine() -> AREngine:
@@ -658,6 +662,25 @@ def get_engine() -> AREngine:
     if _ENGINE is None:
         _ENGINE = AREngine()
     return _ENGINE
+
+
+def _get_crown_tracker(crown_effect: Effect | None = None) -> CrownTracker | None:
+    """Return a shared CrownTracker instance, initializing it on demand."""
+
+    global _CROWN_TRACKER
+    if _CROWN_TRACKER is not None:
+        return _CROWN_TRACKER
+    if mp is None:
+        return None
+    crown_image_path = None
+    if crown_effect is not None:
+        crown_image_path = str(crown_effect.sprite_path)
+    try:
+        _CROWN_TRACKER = CrownTracker(crown_image_path)
+    except Exception as exc:  # pragma: no cover - runtime diagnostics
+        print("[DEBUG] CrownTracker init failed:", exc)
+        _CROWN_TRACKER = None
+    return _CROWN_TRACKER
 
 
 # ---------------------------------------------------------------------------
@@ -1124,11 +1147,30 @@ def _compose_with_state(
 def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float) -> np.ndarray:
     if not active_effects:
         # no AR overlays requested; don't touch Mediapipe at all
+        print("[DEBUG] apply_ar_effects final effects:", [])
         return frame
-    engine = get_engine()
-    engine.update_frame(frame, timestamp)
-    state = engine.get_state()
-    return _compose_with_state(frame, active_effects, state, timestamp, engine)
+
+    effect_names = [effect.name for effect in active_effects]
+    residual_effects = [effect for effect in active_effects if effect.name not in _SPECIAL_EFFECTS]
+
+    composed = frame.copy()
+    engine: AREngine | None = None
+    state: dict[str, Any] | None = None
+
+    if residual_effects:
+        engine = get_engine()
+        engine.update_frame(frame, timestamp)
+        state = engine.get_state()
+        composed = _compose_with_state(composed, residual_effects, state, timestamp, engine)
+
+    if "crown_basic" in effect_names:
+        crown_effect = next((effect for effect in active_effects if effect.name == "crown_basic"), None)
+        tracker = _get_crown_tracker(crown_effect)
+        if tracker is not None:
+            composed, _ = tracker.apply(composed, {"enable_crown": True})
+
+    print("[DEBUG] apply_ar_effects final effects:", effect_names)
+    return composed
 
 
 def apply_to_still(
@@ -1138,11 +1180,26 @@ def apply_to_still(
 ) -> tuple[np.ndarray, dict[str, Any] | None]:
     """Apply effects to a still image and return the composed frame and AR state."""
 
-    engine = get_engine()
     if timestamp is None:
         timestamp = time.time()
-    state = engine.process_static_frame(frame, timestamp)
-    composed = _compose_with_state(frame, active_effects, state, timestamp, engine)
+
+    effect_names = [effect.name for effect in active_effects]
+    residual_effects = [effect for effect in active_effects if effect.name not in _SPECIAL_EFFECTS]
+
+    state: dict[str, Any] | None = None
+    composed = frame.copy()
+
+    if residual_effects:
+        engine = get_engine()
+        state = engine.process_static_frame(frame, timestamp)
+        composed = _compose_with_state(composed, residual_effects, state, timestamp, engine)
+
+    if "crown_basic" in effect_names:
+        crown_effect = next((effect for effect in active_effects if effect.name == "crown_basic"), None)
+        tracker = _get_crown_tracker(crown_effect)
+        if tracker is not None:
+            composed, _ = tracker.apply(composed, {"enable_crown": True})
+
     return composed, state
 
 
