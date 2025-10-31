@@ -654,6 +654,7 @@ class AREngine:
 
 _ENGINE: AREngine | None = None
 _CROWN_TRACKER: CrownTracker | None = None
+_FALLBACK_CROWN_CACHE: dict[str, np.ndarray] = {}
 _SPECIAL_EFFECTS = {"crown_basic"}
 
 
@@ -681,6 +682,72 @@ def _get_crown_tracker(crown_effect: Effect | None = None) -> CrownTracker | Non
         print("[DEBUG] CrownTracker init failed:", exc)
         _CROWN_TRACKER = None
     return _CROWN_TRACKER
+
+
+def _load_crown_sprite_bgra(crown_effect: Effect | None = None) -> np.ndarray | None:
+    """Return a BGRA numpy array of the crown sprite for fallback rendering."""
+
+    if crown_effect is not None:
+        key = str(crown_effect.sprite_path)
+        sprite_path = Path(crown_effect.sprite_path)
+        ensure_sample_sprite(crown_effect.name, sprite_path)
+    else:
+        key = "__default__"
+        sprite_path = Path(__file__).resolve().parent / "assets" / "ar" / "crown" / "crown.png"
+        ensure_sample_sprite("crown_basic", sprite_path)
+
+    cached = _FALLBACK_CROWN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if not sprite_path.exists():
+        return None
+
+    try:
+        image = Image.open(sprite_path).convert("RGBA")
+    except Exception as exc:  # pragma: no cover - runtime diagnostics
+        print("[DEBUG] Failed to load fallback crown sprite:", exc)
+        return None
+
+    bgra = cv2.cvtColor(np.array(image), cv2.COLOR_RGBA2BGRA)
+    _FALLBACK_CROWN_CACHE[key] = bgra
+    return bgra
+
+
+def draw_fallback_crown(frame_bgr: np.ndarray, crown_effect: Effect | None = None) -> np.ndarray:
+    """Overlay a static crown sprite near the top center of the frame."""
+
+    crown_bgra = _load_crown_sprite_bgra(crown_effect)
+    if crown_bgra is None:
+        return frame_bgr
+
+    output = frame_bgr.copy()
+    frame_h, frame_w = output.shape[:2]
+
+    target_w = max(int(frame_w * 0.3), 1)
+    scale = target_w / max(crown_bgra.shape[1], 1)
+    target_h = max(int(crown_bgra.shape[0] * scale), 1)
+    resized = cv2.resize(crown_bgra, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+    x = int(frame_w / 2 - target_w / 2)
+    y = int(frame_h * 0.25 - target_h / 2)
+    x = max(0, min(frame_w - target_w, x))
+    y = max(0, min(frame_h - target_h, y))
+
+    roi = output[y : y + target_h, x : x + target_w]
+    if roi.shape[:2] != (target_h, target_w):
+        return output
+
+    overlay_bgr = resized[:, :, :3].astype(np.float32)
+    alpha = resized[:, :, 3].astype(np.float32) / 255.0
+    alpha = np.clip(alpha, 0.0, 1.0)[..., None]
+
+    base_region = roi.astype(np.float32)
+    blended = overlay_bgr * alpha + base_region * (1.0 - alpha)
+    output[y : y + target_h, x : x + target_w] = np.clip(blended, 0, 255).astype(np.uint8)
+
+    print("[DEBUG] draw_fallback_crown applied at:", x, y)
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -1151,6 +1218,7 @@ def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float)
         return frame
 
     effect_names = [effect.name for effect in active_effects]
+    print("[DEBUG] effect_names in apply_ar_effects:", effect_names)
     residual_effects = [effect for effect in active_effects if effect.name not in _SPECIAL_EFFECTS]
 
     composed = frame.copy()
@@ -1166,8 +1234,18 @@ def apply(frame: np.ndarray, active_effects: Sequence[Effect], timestamp: float)
     if "crown_basic" in effect_names:
         crown_effect = next((effect for effect in active_effects if effect.name == "crown_basic"), None)
         tracker = _get_crown_tracker(crown_effect)
+        faces: list[dict[str, float]] | None = None
         if tracker is not None:
-            composed, _ = tracker.apply(composed, {"enable_crown": True})
+            composed_candidate, faces = tracker.apply(composed, {"enable_crown": True, "ema_alpha": 0.2})
+            print("[DEBUG] crown_tracker faces:", len(faces) if faces is not None else "None")
+            if faces:
+                composed = composed_candidate
+            else:
+                composed = draw_fallback_crown(composed, crown_effect)
+        else:
+            print("[DEBUG] crown_tracker unavailable; using fallback crown")
+            composed = draw_fallback_crown(composed, crown_effect)
+        print("[DEBUG] apply_ar_effects returning composited frame with crown")
 
     print("[DEBUG] apply_ar_effects final effects:", effect_names)
     return composed
@@ -1197,8 +1275,17 @@ def apply_to_still(
     if "crown_basic" in effect_names:
         crown_effect = next((effect for effect in active_effects if effect.name == "crown_basic"), None)
         tracker = _get_crown_tracker(crown_effect)
+        faces: list[dict[str, float]] | None = None
         if tracker is not None:
-            composed, _ = tracker.apply(composed, {"enable_crown": True})
+            composed_candidate, faces = tracker.apply(composed, {"enable_crown": True, "ema_alpha": 0.2})
+            print("[DEBUG] crown_tracker faces (still):", len(faces) if faces is not None else "None")
+            if faces:
+                composed = composed_candidate
+            else:
+                composed = draw_fallback_crown(composed, crown_effect)
+        else:
+            print("[DEBUG] crown_tracker unavailable for still; using fallback crown")
+            composed = draw_fallback_crown(composed, crown_effect)
 
     return composed, state
 

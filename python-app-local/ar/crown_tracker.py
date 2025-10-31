@@ -103,6 +103,7 @@ class CrownTracker:
             output = self._overlay_crown(output, smoothed, params['radius'])
 
         self._previous_states = new_states
+        print("[DEBUG] CrownTracker.apply returning faces:", len(face_centers))
         return output, face_centers
 
     # ------------------------------------------------------------------
