@@ -404,9 +404,22 @@ class KisekaePresetModal(ctk.CTkToplevel):
                 self.previews[effect.name] = ct_img
                 row = ctk.CTkFrame(tab)
                 row.pack(fill="x", padx=8, pady=6)
-                chk = ctk.CTkCheckBox(row, text=effect.display_name, image=ct_img, compound="left", variable=var,
-                                      command=self._propagate)
-                chk.pack(anchor="w", padx=6, pady=4)
+
+                content = ctk.CTkFrame(row)
+                content.pack(anchor="w", padx=6, pady=4, fill="x")
+
+                img_label = ctk.CTkLabel(content, image=ct_img, text="")
+                img_label.image = ct_img  # prevent GC
+                img_label.pack(side="left", padx=(0, 8))
+
+                chk = ctk.CTkCheckBox(content, text=effect.display_name, variable=var, command=self._propagate)
+                chk.pack(side="left")
+
+                def _toggle_and_propagate(v=var):
+                    v.set(not v.get())
+                    self._propagate()
+
+                img_label.bind("<Button-1>", lambda e, toggle=_toggle_and_propagate: toggle())
                 if effect.description:
                     ctk.CTkLabel(row, text=effect.description, justify="left", wraplength=320, anchor="w").pack(
                         anchor="w", padx=32, pady=(0, 6)
