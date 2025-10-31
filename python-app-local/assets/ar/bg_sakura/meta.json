@@ -1,0 +1,16 @@
+{
+  "name": "bg_sakura",
+  "display_name": "背景：桜",
+  "description": "桜色のふんわり背景",
+  "category": "背景",
+  "priority": 0,
+  "sprite": "bg_sakura.png",
+  "anchors": [
+    {
+      "type": "background",
+      "z_index": -20,
+      "mask_with_segmentation": true,
+      "opacity": 1.0
+    }
+  ]
+}

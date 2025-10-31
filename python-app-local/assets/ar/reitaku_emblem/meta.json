@@ -1,0 +1,31 @@
+{
+  "name": "reitaku_emblem_hand",
+  "display_name": "麗澤校章",
+  "description": "お椀の手のひらに現れる校章エフェクト",
+  "category": "手",
+  "priority": 70,
+  "sprite": "reitaku_emblem.png",
+  "anchors": [
+    {
+      "type": "hand",
+      "handedness": ["Left", "Right"],
+      "landmarks": ["PALM_CENTER", "THUMB_TIP", "PINKY_TIP"],
+      "transform": {
+        "scale_from": "distance('THUMB_TIP','PINKY_TIP') * 1.4",
+        "rotation_from": "hand_rotation",
+        "offset_px": ["0", "-0.15 * distance('THUMB_TIP','PINKY_TIP')"]
+      },
+      "z_index": 30,
+      "opacity": 0.95
+    }
+  ],
+  "conditions": {
+    "gesture": ["bowl_left", "bowl_right"]
+  },
+  "animation": {
+    "type": "sine",
+    "speed_hz": 1.2,
+    "alpha_pulse": [0.7, 1.0],
+    "amplitude_px": 6
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "cheek_heart",
+  "display_name": "ほっぺハート",
+  "description": "頬を彩るキュートなハートチーク",
+  "category": "コスメ",
+  "priority": 60,
+  "sprite": "cheek_heart.png",
+  "anchors": [
+    {
+      "type": "face",
+      "landmarks": ["LEFT_CHEEK", "LEFT_EYE_OUTER"],
+      "transform": {
+        "scale_from": "distance('LEFT_EAR','RIGHT_EAR') * 0.35",
+        "rotation_from": "angle_deg('LEFT_EAR','RIGHT_EAR')",
+        "offset_px": ["-0.15 * distance('LEFT_EAR','RIGHT_EAR')", "0.05 * distance('LEFT_EAR','RIGHT_EAR')"]
+      },
+      "z_index": 22,
+      "opacity": 1.0
+    },
+    {
+      "type": "face",
+      "landmarks": ["RIGHT_CHEEK", "RIGHT_EYE_OUTER"],
+      "transform": {
+        "scale_from": "distance('LEFT_EAR','RIGHT_EAR') * 0.35",
+        "rotation_from": "angle_deg('LEFT_EAR','RIGHT_EAR')",
+        "offset_px": ["0.15 * distance('LEFT_EAR','RIGHT_EAR')", "0.05 * distance('LEFT_EAR','RIGHT_EAR')"]
+      },
+      "z_index": 22,
+      "opacity": 1.0,
+      "horizontal_flip": true
+    }
+  ]
+}

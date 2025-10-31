@@ -1,0 +1,39 @@
+{
+  "name": "fairy_glow",
+  "display_name": "フェアリーライト",
+  "description": "耳の後ろで淡く瞬く光の粒子",
+  "category": "頭",
+  "priority": 45,
+  "sprite": "fairy_glow.png",
+  "anchors": [
+    {
+      "type": "face",
+      "landmarks": ["LEFT_EAR", "FOREHEAD_CENTER"],
+      "transform": {
+        "scale_from": "distance('LEFT_EAR','RIGHT_EAR') * 0.7",
+        "rotation_from": "angle_deg('LEFT_EAR','RIGHT_EAR')",
+        "offset_px": ["-0.45 * distance('LEFT_EAR','RIGHT_EAR')", "-0.05 * distance('LEFT_EAR','RIGHT_EAR')"]
+      },
+      "z_index": 5,
+      "opacity": 0.85
+    },
+    {
+      "type": "face",
+      "landmarks": ["RIGHT_EAR", "FOREHEAD_CENTER"],
+      "transform": {
+        "scale_from": "distance('LEFT_EAR','RIGHT_EAR') * 0.7",
+        "rotation_from": "angle_deg('LEFT_EAR','RIGHT_EAR')",
+        "offset_px": ["0.45 * distance('LEFT_EAR','RIGHT_EAR')", "-0.05 * distance('LEFT_EAR','RIGHT_EAR')"]
+      },
+      "z_index": 4,
+      "opacity": 0.8,
+      "horizontal_flip": true
+    }
+  ],
+  "animation": {
+    "type": "sine",
+    "speed_hz": 2.0,
+    "alpha_pulse": [0.6, 1.0],
+    "amplitude_px": 6
+  }
+}

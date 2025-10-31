@@ -13,16 +13,17 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ar_effects import Effect
 
 import cv2
 from PIL import Image, ImageDraw
 import qrcode
 import customtkinter as ctk
-from tkinter import colorchooser
 
-from ar.crown_tracker import CrownTracker
-from ar.aura import AuraRenderer
+from ar_effects import apply as apply_ar_effects
 from draw import coords as coord_utils
 from draw.smoothing import StrokeSmoother
 from ui.consent import request_share_consent
@@ -53,19 +54,9 @@ class CameraCapture:
         param camera_thread: 起動済み/未起動の CameraThread インスタンス
         """
         self.thread = camera_thread
-        self.crown_tracker = CrownTracker()
-        self.aura_renderer = AuraRenderer()
         self._last_raw_frame: cv2.typing.MatLike | None = None
-        self.ar_settings: dict[str, Any] = {
-            'enable_crown': True,
-            'enable_aura': True,
-            'ema_alpha': 0.2,
-            'aura_color': (255, 120, 220),
-            'aura_intensity': 0.6,
-            'aura_frequency': 1.5,
-            'aura_spread': 2.0,
-            'aura_mix_mode': 'rgb_add',
-        }
+        self.active_effects: list['Effect'] = []
+        self._last_error: str | None = None
 
     def start(self):
         """
@@ -96,9 +87,9 @@ class CameraCapture:
         frame = self.thread.get_latest_frame()
         if frame is not None:
             self._last_raw_frame = frame.copy()
-            return frame
+            return self._apply_effects(frame)
         if self._last_raw_frame is not None:
-            return self._last_raw_frame.copy()
+            return self._apply_effects(self._last_raw_frame.copy())
         return None
 
     def get_display_frame(self) -> ctk.CTkImage | None:
@@ -115,20 +106,29 @@ class CameraCapture:
         frame = self.thread.get_latest_frame()
         if frame is not None:
             self._last_raw_frame = frame.copy()
-            processed, faces = self.crown_tracker.apply(frame, self.ar_settings)
-            processed = self.aura_renderer.apply(processed, faces, self.ar_settings)
+            processed = self._apply_effects(frame)
             frame_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
             img.thumbnail((960, 540))
             return ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
         return None
 
-    def configure_ar(self, settings: dict[str, Any]):
-        """AR関連の設定を更新する。"""
+    def set_active_effects(self, effects: list['Effect']):
+        """アクティブなARエフェクトを更新する。"""
 
-        self.ar_settings.update(settings)
-        if not self.ar_settings.get('enable_crown', True):
-            self.crown_tracker.reset()
+        self.active_effects = effects
+
+    def pop_last_error(self) -> str | None:
+        msg = self._last_error
+        self._last_error = None
+        return msg
+
+    def _apply_effects(self, frame: cv2.typing.MatLike) -> cv2.typing.MatLike:
+        try:
+            return apply_ar_effects(frame, self.active_effects, time.time())
+        except Exception as exc:  # pragma: no cover - runtime diagnostic
+            self._last_error = f"ARエフェクト適用に失敗しました: {exc}"
+            return frame.copy()
 
 
 class AssetManager:
@@ -368,6 +368,80 @@ class _ScrollableThumbs(ctk.CTkScrollableFrame):
             self._row += 1
 
 
+class KisekaePresetModal(ctk.CTkToplevel):
+    """カテゴリ別にARきせかえエフェクトを選択するモーダル。"""
+
+    def __init__(self, parent, controller, on_apply):
+        super().__init__(parent)
+        self.title("きせかえプリセット")
+        self.geometry("560x520")
+        self.resizable(False, False)
+        self.controller = controller
+        self.on_apply = on_apply
+        self.vars: dict[str, ctk.BooleanVar] = {}
+        self.previews: dict[str, ctk.CTkImage] = {}
+        self.catalog = controller.get_effect_catalog()
+        self.active = set(controller.get_active_effect_names())
+
+        tabview = ctk.CTkTabview(self)
+        tabview.pack(fill="both", expand=True, padx=12, pady=12)
+
+        for category in ["頭", "顔", "コスメ", "衣装", "手", "背景", "パック"]:
+            tab = tabview.add(category)
+            if category == "パック":
+                self._build_pack_tab(tab)
+                continue
+            effects = self.catalog.get(category, [])
+            if not effects:
+                ctk.CTkLabel(tab, text="このカテゴリのエフェクトはありません", anchor="w").pack(padx=12, pady=12)
+                continue
+            for effect in effects:
+                var = ctk.BooleanVar(value=effect.name in self.active)
+                self.vars[effect.name] = var
+                preview_img = effect.get_preview_image().copy()
+                preview_img.thumbnail((96, 96))
+                ct_img = ctk.CTkImage(light_image=preview_img, dark_image=preview_img, size=preview_img.size)
+                self.previews[effect.name] = ct_img
+                row = ctk.CTkFrame(tab)
+                row.pack(fill="x", padx=8, pady=6)
+                chk = ctk.CTkCheckBox(row, text=effect.display_name, image=ct_img, compound="left", variable=var,
+                                      command=self._propagate)
+                chk.pack(anchor="w", padx=6, pady=4)
+                if effect.description:
+                    ctk.CTkLabel(row, text=effect.description, justify="left", wraplength=320, anchor="w").pack(
+                        anchor="w", padx=32, pady=(0, 6)
+                    )
+
+        ctk.CTkButton(self, text="閉じる", command=self.destroy).pack(pady=(0, 12))
+
+    def _build_pack_tab(self, tab):
+        packs = self.controller.get_effect_packs()
+        if not packs:
+            ctk.CTkLabel(tab, text="利用可能なパックはありません").pack(pady=18)
+            return
+        for name, effect_names in packs.items():
+            def _apply(names=effect_names):
+                for effect_name in names:
+                    if effect_name not in self.vars:
+                        continue
+                    self.vars[effect_name].set(True)
+                self._propagate()
+
+            btn = ctk.CTkButton(tab, text=name, command=_apply)
+            btn.pack(fill="x", padx=16, pady=10)
+
+    def _propagate(self):
+        active = [name for name, var in self.vars.items() if var.get()]
+        self.active = set(active)
+        if callable(self.on_apply):
+            self.on_apply(active)
+
+    def update_checks(self, active_names: Iterable[str]):
+        active = set(active_names)
+        for name, var in self.vars.items():
+            var.set(name in active)
+        self.active = active
+
 class BackgroundSelector(ctk.CTkToplevel):
     """
     フレーム（背景）画像を選択するポップアップ。
@@ -593,27 +667,7 @@ class ShootingFrame(ctk.CTkFrame):
         """
         super().__init__(parent)
         self.controller = controller
-        settings = getattr(controller, 'ar_settings', {
-            'enable_crown': True,
-            'enable_aura': True,
-            'ema_alpha': 0.2,
-            'aura_color': (255, 120, 220),
-            'aura_intensity': 0.6,
-            'aura_frequency': 1.5,
-            'aura_spread': 2.0,
-            'aura_mix_mode': 'rgb_add',
-        })
-        self.ar_vars = {
-            'enable_crown': ctk.BooleanVar(value=settings.get('enable_crown', True)),
-            'enable_aura': ctk.BooleanVar(value=settings.get('enable_aura', True)),
-            'ema_alpha': ctk.DoubleVar(value=settings.get('ema_alpha', 0.2)),
-            'aura_intensity': ctk.DoubleVar(value=settings.get('aura_intensity', 0.6)),
-            'aura_frequency': ctk.DoubleVar(value=settings.get('aura_frequency', 1.5)),
-            'aura_spread': ctk.DoubleVar(value=settings.get('aura_spread', 2.0)),
-            'aura_mix_mode': ctk.StringVar(value=settings.get('aura_mix_mode', 'rgb_add')),
-        }
-        self.ar_color_var = ctk.StringVar(value=self._rgb_to_hex(settings.get('aura_color', (255, 120, 220))))
-        self.ar_window: ctk.CTkToplevel | None = None
+        self.kisekae_modal: KisekaePresetModal | None = None
 
         # ライブビュー
         self.preview_label = ctk.CTkLabel(self, text="カメラ接続中…", width=800, height=450, corner_radius=12)
@@ -633,112 +687,37 @@ class ShootingFrame(ctk.CTkFrame):
                       command=controller.go_to_photo_selection).grid(row=0, column=1, padx=6)
         ctk.CTkButton(btn_row, text="やりなおす", width=140,
                       command=controller.retake_photos).grid(row=0, column=2, padx=6)
-        ctk.CTkButton(btn_row, text="AR設定", width=140, command=self.open_ar_settings).grid(row=0, column=3, padx=6)
+        ctk.CTkButton(btn_row, text="きせかえ", width=140, command=self.open_kisekae_modal).grid(row=0, column=3, padx=6)
 
         # 撮影枚数
         self.count_taken_var = ctk.StringVar(value="0 枚")
         ctk.CTkLabel(self, text="撮影済み：", font=ctk.CTkFont(size=14)).pack()
         ctk.CTkLabel(self, textvariable=self.count_taken_var).pack()
 
+        self.active_effects_label = ctk.CTkLabel(self, text="きせかえ: なし")
+        self.active_effects_label.pack(pady=(4, 0))
+
         self._after_id = None
 
-    def _rgb_to_hex(self, color: tuple[int, int, int]) -> str:
-        """RGBタプルを#RRGGBB形式に変換する。"""
+    def open_kisekae_modal(self):
+        """きせかえ選択モーダルを開く。"""
 
-        return "#" + "".join(f"{max(0, min(255, c)):02x}" for c in color)
-
-    def _hex_to_rgb(self, hex_color: str) -> tuple[int, int, int]:
-        """#RRGGBB文字列をRGBタプルへ変換する。"""
-
-        hex_color = hex_color.lstrip('#')
-        if len(hex_color) != 6:
-            return (255, 120, 220)
-        return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
-
-    def open_ar_settings(self):
-        """AR設定モーダルを開く。"""
-
-        if self.ar_window and self.ar_window.winfo_exists():
-            self.ar_window.focus()
+        if self.kisekae_modal and self.kisekae_modal.winfo_exists():
+            self.kisekae_modal.focus_set()
+            self.kisekae_modal.update_checks(self.controller.get_active_effect_names())
             return
-        current = getattr(self.controller, 'ar_settings', {})
-        for key, var in self.ar_vars.items():
-            if key in current:
-                value = current[key]
-                if isinstance(var, ctk.BooleanVar):
-                    var.set(bool(value))
-                elif isinstance(var, ctk.DoubleVar):
-                    var.set(float(value))
-                else:
-                    var.set(str(value))
-        if 'aura_color' in current:
-            self.ar_color_var.set(self._rgb_to_hex(tuple(current['aura_color'])))
-        self.ar_window = ctk.CTkToplevel(self)
-        self.ar_window.title("ARエフェクト設定")
-        self.ar_window.geometry("360x460")
-        self.ar_window.resizable(False, False)
+        self.kisekae_modal = KisekaePresetModal(self, self.controller, self._apply_kisekae_selection)
+        self.kisekae_modal.focus_set()
 
-        ctk.CTkLabel(self.ar_window, text="王冠", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(16, 4))
-        ctk.CTkSwitch(self.ar_window, text="王冠を表示", variable=self.ar_vars['enable_crown'],
-                      command=self.apply_ar_settings).pack(pady=4)
-        ctk.CTkLabel(self.ar_window, text="王冠EMA α").pack(pady=(8, 2))
-        ema_slider = ctk.CTkSlider(self.ar_window, from_=0.05, to=0.8, number_of_steps=75,
-                                   variable=self.ar_vars['ema_alpha'], command=lambda _: self.apply_ar_settings())
-        ema_slider.pack(padx=18, fill="x")
+    def _apply_kisekae_selection(self, names: list[str]):
+        if hasattr(self.controller, 'set_active_effects'):
+            self.controller.set_active_effects(names)
 
-        ctk.CTkLabel(self.ar_window, text="波動", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(18, 4))
-        ctk.CTkSwitch(self.ar_window, text="波動を表示", variable=self.ar_vars['enable_aura'],
-                      command=self.apply_ar_settings).pack(pady=4)
-        color_row = ctk.CTkFrame(self.ar_window)
-        color_row.pack(pady=(8, 2), fill="x", padx=18)
-        ctk.CTkLabel(color_row, text="色").pack(side="left")
-        ctk.CTkButton(color_row, textvariable=self.ar_color_var, command=self._choose_color).pack(side="left", padx=12)
-
-        ctk.CTkLabel(self.ar_window, text="強度").pack(pady=(8, 2))
-        intensity_slider = ctk.CTkSlider(self.ar_window, from_=0.1, to=1.5, number_of_steps=28,
-                                         variable=self.ar_vars['aura_intensity'], command=lambda _: self.apply_ar_settings())
-        intensity_slider.pack(padx=18, fill="x")
-
-        ctk.CTkLabel(self.ar_window, text="周波数").pack(pady=(8, 2))
-        freq_slider = ctk.CTkSlider(self.ar_window, from_=0.5, to=3.0, number_of_steps=25,
-                                    variable=self.ar_vars['aura_frequency'], command=lambda _: self.apply_ar_settings())
-        freq_slider.pack(padx=18, fill="x")
-
-        ctk.CTkLabel(self.ar_window, text="拡散速度").pack(pady=(8, 2))
-        spread_slider = ctk.CTkSlider(self.ar_window, from_=0.5, to=4.0, number_of_steps=35,
-                                      variable=self.ar_vars['aura_spread'], command=lambda _: self.apply_ar_settings())
-        spread_slider.pack(padx=18, fill="x")
-
-        ctk.CTkLabel(self.ar_window, text="混色モード").pack(pady=(10, 4))
-        mix_menu = ctk.CTkOptionMenu(self.ar_window, values=["rgb_add", "hsv"],
-                                     variable=self.ar_vars['aura_mix_mode'], command=lambda _: self.apply_ar_settings())
-        mix_menu.pack(pady=(0, 16))
-
-        ctk.CTkButton(self.ar_window, text="閉じる", command=self.ar_window.destroy).pack(pady=(0, 18))
-
-    def _choose_color(self):
-        """色選択ダイアログを開いて更新する。"""
-
-        rgb_tuple, hex_color = colorchooser.askcolor(color=self.ar_color_var.get(), title="波動カラー")
-        if hex_color:
-            self.ar_color_var.set(hex_color)
-            self.apply_ar_settings()
-
-    def apply_ar_settings(self):
-        """UIの値を収集してコントローラへ通知する。"""
-
-        updated = {
-            'enable_crown': self.ar_vars['enable_crown'].get(),
-            'enable_aura': self.ar_vars['enable_aura'].get(),
-            'ema_alpha': float(self.ar_vars['ema_alpha'].get()),
-            'aura_intensity': float(self.ar_vars['aura_intensity'].get()),
-            'aura_frequency': float(self.ar_vars['aura_frequency'].get()),
-            'aura_spread': float(self.ar_vars['aura_spread'].get()),
-            'aura_mix_mode': self.ar_vars['aura_mix_mode'].get(),
-            'aura_color': self._hex_to_rgb(self.ar_color_var.get()),
-        }
-        if hasattr(self.controller, 'update_ar_settings'):
-            self.controller.update_ar_settings(updated)
+    def update_active_effects_display(self, label: str):
+        summary = label if label else "なし"
+        self.active_effects_label.configure(text=f"きせかえ: {summary}")
+        if self.kisekae_modal and self.kisekae_modal.winfo_exists():
+            self.kisekae_modal.update_checks(self.controller.get_active_effect_names())
 
     def reset(self):
         """
@@ -749,6 +728,8 @@ class ShootingFrame(ctk.CTkFrame):
         if self._after_id:
             self.after_cancel(self._after_id)
             self._after_id = None
+        if hasattr(self.controller, 'get_active_effect_summary'):
+            self.update_active_effects_display(self.controller.get_active_effect_summary())
 
     def update_camera_feed(self):
         """
@@ -766,6 +747,10 @@ class ShootingFrame(ctk.CTkFrame):
             self.preview_label.image = frame_img  # 参照保持
             if str(self.shoot_button.cget("state")) == "disabled":
                 self.shoot_button.configure(state="normal")
+        if self.controller.camera:
+            err = self.controller.camera.pop_last_error()
+            if err:
+                self.controller.status_var.set(err)
         self._after_id = self.after(33, self.update_camera_feed)
 
     def update_countdown(self, n: int):

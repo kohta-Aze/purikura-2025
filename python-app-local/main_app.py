@@ -16,12 +16,15 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, List
 
 import cv2
 import numpy as np
 import requests
 from PIL import Image
 import customtkinter as ctk
+
+from ar_effects import get_effect_packs as fetch_effect_packs, get_effects_by_category, load_effects, resolve_effects
 
 # editor_app 側の画面/専門家
 from editor_app import (
@@ -31,6 +34,9 @@ from editor_app import (
 )
 from ui.consent import request_share_consent
 from ui.privacy_consent import PrivacyConsentManager
+
+if TYPE_CHECKING:
+    from ar_effects import Effect
 
 
 class ImageUploader:
@@ -243,16 +249,8 @@ class MainApplication(ctk.CTk):
         self.samples_dir.mkdir(exist_ok=True)
         self.sample_index_path = self.samples_dir / "index.json"
         self._ensure_sample_index()
-        self.ar_settings: dict[str, object] = {
-            'enable_crown': True,
-            'enable_aura': True,
-            'ema_alpha': 0.2,
-            'aura_color': (255, 120, 220),
-            'aura_intensity': 0.6,
-            'aura_frequency': 1.5,
-            'aura_spread': 2.0,
-            'aura_mix_mode': 'rgb_add',
-        }
+        self.effect_registry = load_effects()
+        self.active_effect_names: list[str] = []
 
         # 専門家インスタンス
         self.camera = None
@@ -289,6 +287,7 @@ class MainApplication(ctk.CTk):
         self.status_var = ctk.StringVar(value="準備完了")
         self.status_bar = ctk.CTkLabel(self, textvariable=self.status_var, anchor="w")
         self.status_bar.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
+        self.set_active_effects([])
 
         self.after(100, self.consent_manager.ensure_consent)
 
@@ -307,12 +306,40 @@ class MainApplication(ctk.CTk):
         if hasattr(frame, 'on_show'):
             frame.on_show()
 
-    def update_ar_settings(self, settings: dict[str, object]):
-        """AR設定を更新し、カメラへ反映する。"""
+    def set_active_effects(self, names: List[str]):
+        """有効化するARエフェクトのリストを更新する。"""
 
-        self.ar_settings.update(settings)
+        unique: list[str] = []
+        for name in names:
+            if name in self.effect_registry and name not in unique:
+                unique.append(name)
+        unique.sort(key=lambda n: self.effect_registry[n].priority)
+        self.active_effect_names = unique
         if self.camera:
-            self.camera.configure_ar(self.ar_settings)
+            self.camera.set_active_effects(self._resolve_active_effects())
+        summary = self.get_active_effect_summary()
+        shooting_frame = self.frames.get(ShootingFrame)
+        if shooting_frame:
+            shooting_frame.update_active_effects_display(summary)
+        if hasattr(self, 'status_var'):
+            self.status_var.set(f"きせかえ: {summary if summary else 'なし'}")
+
+    def get_active_effect_names(self) -> list[str]:
+        return list(self.active_effect_names)
+
+    def get_active_effect_summary(self) -> str:
+        if not self.active_effect_names:
+            return ""
+        return " / ".join(self.effect_registry[name].display_name for name in self.active_effect_names)
+
+    def get_effect_catalog(self) -> dict[str, list['Effect']]:
+        return get_effects_by_category()
+
+    def get_effect_packs(self) -> dict[str, list[str]]:
+        return fetch_effect_packs()
+
+    def _resolve_active_effects(self) -> list['Effect']:
+        return resolve_effects(self.active_effect_names)
 
     def _ensure_sample_index(self):
         """samples/index.json が存在しなければ初期化する。"""
@@ -400,8 +427,8 @@ class MainApplication(ctk.CTk):
 
         # 2) カメラ起動
         self.camera = CameraCapture(CameraThread())
-        self.camera.configure_ar(self.ar_settings)
         self.camera.start()
+        self.camera.set_active_effects(self._resolve_active_effects())
 
         # 3) 画面遷移（少し待ってから）
         self.after(500, self._open_shooting_frame)
